@@ -1,0 +1,375 @@
+# Updated proposal: Sublight strategy game
+
+## 1. Project scope
+
+This project is a portrait-first browser game for Android in which the player navigates a spaceship through a sequence of star systems. Movement within a system is turn-based. Inter-system travel is long, dangerous, and tied to cryogenic survival. The game is designed for touch interaction, with no installation requirements beyond opening it in a mobile browser.
+
+The current objective remains a playable MVP with a clear and stable ruleset, robust map interaction, and a system model that can later support additional content and balancing.
+
+---
+
+## 2. Core design principles
+
+1. The game must work reliably in a mobile browser in portrait orientation.
+2. The map must be readable and predictable.
+3. The orbital system must support route planning.
+4. Travel rules must be discrete and understandable.
+5. Waypoints and waypoint content must be treated as separate concepts.
+6. Animations must communicate turn resolution, not idle background motion.
+
+---
+
+## 3. Core game structure
+
+The player progresses through a chain of star systems. Each system contains multiple concentric orbits. Each orbit is divided into equally sized waypoint wedges. The player moves from waypoint to waypoint, encounters events, manages ship state, and exits the system via one of four special outer stations.
+
+The player must survive local movement, combat, hazards, and inter-system transit across a fixed number of systems.
+
+---
+
+## 4. System topology
+
+### 4.1 Orbits
+Each system contains five orbits. From innermost to outermost, the number of waypoint wedges is:
+
+- 4
+- 8
+- 16
+- 32
+- 64
+
+Each orbit is divided into equally sized wedge segments, visually similar to a colour wheel. The entire orbit rotates as one wheel.
+
+### 4.2 Waypoints
+Every wedge segment is a waypoint, regardless of whether anything is currently present there.
+
+This is a critical modelling rule:
+- a waypoint always exists
+- a waypoint may be empty or occupied
+- travel operates on waypoints, not on event objects
+
+This means the player must be able to:
+- select empty waypoints
+- inspect empty waypoints
+- travel to empty waypoints
+
+### 4.3 Waypoint contents
+A waypoint may contain:
+- nothing
+- planet
+- asteroid belt
+- Cardinal space station
+- merchant
+- pirate group
+- patrol
+- distress signal
+- hazard
+- wreck
+- anomaly
+- other placeholder content as needed
+
+There must be substantially more occupied waypoints than in earlier versions. Placeholder content is acceptable for the MVP.
+
+---
+
+## 5. Cardinal space stations
+
+### 5.1 Definition
+The player must start at one of the four star bases on the outermost orbit that allow exit from the current system. From now on, these are called the four Cardinal space stations.
+
+### 5.2 Rules
+- Each system has exactly four Cardinal space stations.
+- All four are on the outermost orbit.
+- They are spaced at the four cardinal positions of that orbit.
+- All four allow exit to another system.
+- The player starts on one of them.
+- When entering a new system, the player is again placed on one of the Cardinal space stations.
+
+### 5.3 Function
+Cardinal space stations serve as:
+- system entry/exit points
+- repair and preparation hubs
+- route-choice nodes for inter-system travel
+
+---
+
+## 6. Orbit motion
+
+### 6.1 Static per-system kinematics
+Within each system, every orbit has:
+- one fixed rotation direction
+- one fixed rotation speed
+
+These values are determined when the system is generated and remain constant while the player is in that system.
+
+The direction and speed may differ between systems, but must not change within a system.
+
+### 6.2 Predictability
+Future waypoint positions must be predictable from:
+- current orbit position
+- fixed orbit direction
+- fixed orbit speed
+
+This is required so the player can plan routes.
+
+### 6.3 Animation timing
+Orbit movement must not occur while the player is planning.
+
+The correct behaviour is:
+- before the player ends their turn, the map is static
+- after the player ends their turn by pressing Travel or Wait, the orbits animate
+- during that same turn-resolution animation, the ship also moves gradually if travel occurred
+- once the animation ends, the new state becomes static again
+
+This means animation is a representation of turn resolution, not continuous idle motion.
+
+---
+
+## 7. Movement rules
+
+### 7.1 Turn-based movement
+Movement inside a system is turn-based.
+
+A turn is committed when the player:
+- presses Travel
+- presses Wait
+- triggers another action that explicitly resolves time
+
+### 7.2 Reachability
+The ship must not be able to cross large parts of the map in a single turn unless its speed is extremely high.
+
+The intended rule is:
+- normal ships: movement range is limited to directly neighbouring waypoints
+- very fast ships: optionally one additional hop beyond the immediate neighbours
+
+For the current proposal, the clean implementation is:
+- default movement range: 1 waypoint hop
+- high-speed ships: 2 waypoint hops only if speed is above a defined threshold
+
+### 7.3 Neighbour logic
+Neighbouring waypoints should be defined structurally, not by raw Euclidean map distance.
+
+A waypoint’s neighbours are:
+- previous slot on the same orbit
+- next slot on the same orbit
+- nearest aligned slot on the adjacent inner orbit
+- nearest aligned slot on the adjacent outer orbit
+
+This produces stable, legible travel behaviour.
+
+### 7.4 Empty waypoints
+Empty waypoints must be legal travel targets. They function as valid transit positions and route-planning anchors.
+
+---
+
+## 8. Travel animation
+
+When the player initiates travel:
+- the ship gradually moves from current waypoint to destination waypoint
+- the orbits rotate during the same animation window
+- the animation begins only after the turn has been committed
+- at animation end, the new waypoint and orbit states are committed
+
+When the player waits:
+- the ship remains in place
+- the orbits animate their turn advancement
+- the new orbit positions are then committed
+
+---
+
+## 9. Special system elements
+
+### 9.1 Asteroid belts
+Each system has at least one asteroid belt. An asteroid belt:
+- occupies ordinary waypoint segments like any other orbit element
+- contains dwarf planets and asteroids
+- can be mined if the ship has a Mining Laser
+
+Mining Laser is therefore a ship weapon/tool that must exist in the game.
+
+### 9.2 Interplanetary meteor streams
+Meteorites may occasionally cross the system on a visible, predictable line. If the player is positioned appropriately, they can hitch a ride along that line.
+
+This remains an event-based movement modifier and should be visibly shown on the system map.
+
+---
+
+## 10. Ship model
+
+### 10.1 Key stats
+Relevant ship statistics include:
+- hull
+- shields
+- armour
+- speed
+- manoeuvrability
+- cargo capacity
+- cryo bed count
+- equipped weapons
+
+### 10.2 Speed
+Speed determines:
+- how many waypoint hops can be made in a turn
+- how long travel takes in relative terms
+- how effectively the player can avoid long local transit times
+
+### 10.3 Manoeuvrability
+Manoeuvrability determines dodge probability in combat.
+
+It is no longer the same thing as travel speed.
+
+---
+
+## 11. User interface
+
+## 11.1 Terminal structure
+The interface consists of three visually distinct terminals, stacked vertically:
+
+1. Primary terminal
+2. Secondary terminal
+3. Tertiary terminal
+
+### 11.2 Primary terminal
+The primary terminal contains three tabs:
+- System
+- Local
+- Ship
+
+#### System
+Shows the full star system map.
+- all waypoint wedges are visible
+- pinch zoom and drag are allowed here only
+- selecting a waypoint shows its information in the secondary terminal
+- current player location has a strong red outline
+- reachable waypoints are highlighted
+
+#### Local
+Shows the player ship and the main local object at the current waypoint.
+
+#### Ship
+Shows ship image, state, cargo, equipment, and core stats.
+
+### 11.3 Secondary terminal
+The secondary terminal is used for selected-waypoint information and local actions.
+
+Top-row buttons:
+- Legend
+- Wait
+- Travel
+
+Travel must:
+- act on the currently selected waypoint only
+- be green and bold if the selected waypoint is reachable
+- be greyed out otherwise
+
+This terminal also shows:
+- details for the selected waypoint
+- legend contents when legend is open
+- actions relevant to the current waypoint
+
+### 11.4 Tertiary terminal
+The tertiary terminal shows ongoing events and recent logs.
+
+---
+
+## 12. Combat
+
+Ship-to-ship combat remains automated in resolution, with the player influencing the outcome through equipment, ship configuration, and tactical positioning rather than direct manual aiming.
+
+Combat should be visually represented and should use:
+- hull
+- shields
+- armour
+- manoeuvrability
+- weapon cooldowns
+- ammunition where relevant
+
+---
+
+## 13. Data model requirements
+
+To implement the updated design reliably, the system model should separate:
+
+### Waypoint geometry
+Persistent for every slot:
+- waypoint id
+- orbit
+- slot
+
+### Waypoint content
+Optional:
+- kind
+- label
+- description
+- opportunity
+- danger
+- spent state
+- departure index where relevant
+
+This separation is required to support:
+- empty waypoints
+- more placeholder content
+- clean travel logic
+- robust map rendering
+
+---
+
+## 14. State and animation requirements
+
+The implementation should maintain three distinct state layers:
+
+### Static system state
+- orbit offsets
+- orbit directions
+- orbit step shifts
+- waypoint content layout
+
+### Player state
+- current waypoint
+- selected waypoint
+- ship state
+- crew state
+- inventory/resources
+
+### Temporary animation state
+Created only when a turn is committed:
+- from orbit offsets
+- to orbit offsets
+- animation start time
+- duration
+- travel start waypoint
+- travel end waypoint
+
+Animation must interpolate between committed states. It must not derive orbit motion from a free-running idle clock.
+
+---
+
+## 15. Immediate implementation priorities
+
+The next implementation pass should focus on the following in order:
+
+1. Make every wedge a real waypoint object.
+2. Generate exactly four outer Cardinal space stations per system.
+3. Ensure the player starts on one of those four stations.
+4. Allow travel to empty waypoints.
+5. Switch movement to waypoint-hop logic rather than raw geometric reach.
+6. Increase occupied waypoint density using placeholder contents.
+7. Lock orbit direction and speed per system.
+8. Ensure orbit animation begins only after Wait or Travel.
+
+---
+
+## 16. Summary of updated canonical rules
+
+The current canonical design is:
+
+- five-orbit systems with wedge counts 4, 8, 16, 32, 64
+- every wedge is a waypoint
+- many waypoints contain placeholder content
+- empty waypoints are selectable and traversable
+- exactly four outer Cardinal space stations exist per system
+- the player starts on one of those Cardinal space stations
+- orbit speed and direction are fixed within a system
+- the map is static while planning
+- orbits and ship animate only after the turn is ended
+- normal ships move only to neighbouring waypoints; very fast ships may move one hop further
