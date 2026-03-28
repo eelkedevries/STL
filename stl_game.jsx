@@ -14,6 +14,10 @@ const REVERSED_ORBIT_CHANCE = 0.35
 const MIN_ORBIT_SPEED_DIFFERENCE = 0.2
 const MISSILE_CARGO_STACK = 4
 const CREW_LEVEL_THRESHOLDS = [0, 18, 40, 68, 102, 142]
+const HEX_ARENA = { cols: 9, rows: 5, size: 26 }
+const DRONE_SQUADRON_SIZE = 6
+const DRONE_ACTIVE_LIMIT = 1
+const DRONE_REGEN_INTERVAL = 2
 const SYSTEM_TYPES = ['Civilised', 'Pirate', 'Industrial', 'Frontier', 'Research', 'Militarised', 'AI Controlled']
 const NAME_A = ['Vesper', 'Hollow', 'Ash', 'Crown', 'Aster', 'Morrow', 'Lattice', 'Sable', 'Helix', 'Nadir', 'Oris', 'Kestrel']
 const NAME_B = ['Reach', 'Spindle', 'Drift', 'Veil', 'Array', 'Fold', 'March', 'Chorus', 'Node', 'Belt', 'Harbour', 'Melt']
@@ -505,6 +509,14 @@ function equipmentLevel(value) {
   return clamp(Math.round(Number(value) || 1), 1, 5)
 }
 
+function droneMoveRange() {
+  return Math.max(1, Math.round(HEX_ARENA.cols * 0.3))
+}
+
+function hexCombatShipMovePoints(speed) {
+  return clamp(Math.ceil(Math.max(1, Number(speed) || 1) / 2), 1, Math.max(1, droneMoveRange() - 1))
+}
+
 function equipmentLevelSuffix(level) {
   return `Mk ${equipmentLevel(level)}`
 }
@@ -523,6 +535,469 @@ function weaponStatsForLevel(definition, level = 1) {
     hpMax: Math.max(1, Math.round((definition?.hpMax || 12) * (1 + bonus * 0.1))),
     cooldown: Math.max(0.35, (definition?.cooldown || 1) * (1 - bonus * 0.06)),
   }
+}
+
+function hexCombatWeaponCooldownTurns(weapon) {
+  if (!weapon) return 1
+  return 1
+}
+
+function buildHexShipUnit(side, overrides = {}) {
+  const width = Math.max(2, Number(overrides.width) || 2)
+  const height = Math.max(3, Number(overrides.height) || 3)
+  const actionsPerTurn = Math.max(1, Number(overrides.actionsPerTurn ?? overrides.movePointsPerTurn) || 1)
+  return {
+    id: `${side}_ship_unit`,
+    side,
+    type: 'ship',
+    width,
+    height,
+    col: clamp(Number.isFinite(Number(overrides.col)) ? Number(overrides.col) : (side === 'player' ? 0 : HEX_ARENA.cols - width), 0, Math.max(0, HEX_ARENA.cols - width)),
+    row: clamp(Number.isFinite(Number(overrides.row)) ? Number(overrides.row) : Math.max(0, Math.floor((HEX_ARENA.rows - height) / 2)), 0, Math.max(0, HEX_ARENA.rows - height)),
+    actionsPerTurn,
+    actionsRemaining: clamp(Number.isFinite(Number(overrides.actionsRemaining ?? overrides.movePointsRemaining)) ? Number(overrides.actionsRemaining ?? overrides.movePointsRemaining) : actionsPerTurn, 0, actionsPerTurn),
+    attackAvailable: overrides.attackAvailable !== false,
+    movedThisTurn: Boolean(overrides.movedThisTurn),
+    firedThisTurn: Boolean(overrides.firedThisTurn),
+  }
+}
+
+function hexCombatShipFootprint(unit) {
+  const safeUnit = buildHexShipUnit(unit?.side || 'player', unit || {})
+  return Array.from({ length: Math.max(2, safeUnit.width || 2) }, (_, dx) => (
+    Array.from({ length: Math.max(3, safeUnit.height || 3) }, (_, dy) => ({ col: safeUnit.col + dx, row: safeUnit.row + dy }))
+  )).flat()
+}
+
+function hexCombatShipCenter(unit) {
+  const footprint = hexCombatShipFootprint(unit)
+  return footprint[Math.floor((footprint.length - 1) / 2)] || { col: 0, row: 0 }
+}
+
+function hexEquals(a, b) {
+  return a?.col === b?.col && a?.row === b?.row
+}
+
+function hexCombatShipAnchor(side) {
+  return hexCombatShipCenter(buildHexShipUnit(side))
+}
+
+function hexCombatLaunchHex(side, shipUnit = null) {
+  const unit = shipUnit ? buildHexShipUnit(side, shipUnit) : buildHexShipUnit(side)
+  const center = hexCombatShipCenter(unit)
+  return {
+    col: clamp(side === 'player' ? unit.col + unit.width : unit.col - 1, 0, HEX_ARENA.cols - 1),
+    row: clamp(center.row, 0, HEX_ARENA.rows - 1),
+  }
+}
+
+function buildDroneUnit() {
+  return { shield: 1, armour: 1, hull: 1 }
+}
+
+function buildAttackSquadron(side, position = hexCombatLaunchHex(side), overrides = {}) {
+  const actionsPerTurn = Math.max(1, Number(overrides.actionsPerTurn) || droneMoveRange())
+  return {
+    id: createId(`${side}_squadron`),
+    side,
+    type: 'attack',
+    position: { ...position },
+    drones: Array.from({ length: DRONE_SQUADRON_SIZE }, () => buildDroneUnit()),
+    actionsPerTurn,
+    actionsRemaining: clamp(Number.isFinite(Number(overrides.actionsRemaining)) ? Number(overrides.actionsRemaining) : actionsPerTurn, 0, actionsPerTurn),
+    attackAvailable: overrides.attackAvailable !== false,
+    movedThisTurn: Boolean(overrides.movedThisTurn),
+    regenTick: 0,
+    launchedTurn: 0,
+  }
+}
+
+function aliveSquadronDrones(squadron) {
+  return (squadron?.drones || []).filter((drone) => (drone.hull || 0) > 0)
+}
+
+function squadronAliveCount(squadron) {
+  return aliveSquadronDrones(squadron).length
+}
+
+function squadronShieldCount(squadron) {
+  return aliveSquadronDrones(squadron).reduce((sum, drone) => sum + Math.max(0, drone.shield || 0), 0)
+}
+
+function squadronArmourCount(squadron) {
+  return aliveSquadronDrones(squadron).reduce((sum, drone) => sum + Math.max(0, drone.armour || 0), 0)
+}
+
+function oddrToCube(col, row) {
+  const x = col - ((row - (row & 1)) / 2)
+  const z = row
+  const y = -x - z
+  return { x, y, z }
+}
+
+function hexDistance(a, b) {
+  const cubeA = oddrToCube(a.col, a.row)
+  const cubeB = oddrToCube(b.col, b.row)
+  return Math.max(Math.abs(cubeA.x - cubeB.x), Math.abs(cubeA.y - cubeB.y), Math.abs(cubeA.z - cubeB.z))
+}
+
+function hexWithinArena(position) {
+  return position.col >= 0 && position.col < HEX_ARENA.cols && position.row >= 0 && position.row < HEX_ARENA.rows
+}
+
+function distanceToHexGroup(source, hexes = []) {
+  if (!source || !Array.isArray(hexes) || hexes.length === 0) return Number.POSITIVE_INFINITY
+  return Math.min(...hexes.map((hex) => hexDistance(source, hex)))
+}
+
+function squadronAdjacentToShip(squadron, sideOrUnit) {
+  if (!squadron) return false
+  const footprint = typeof sideOrUnit === 'string' ? hexCombatShipFootprint(buildHexShipUnit(sideOrUnit)) : hexCombatShipFootprint(sideOrUnit)
+  return distanceToHexGroup(squadron.position, footprint) <= 1
+}
+
+function applyDamageToSquadron(squadron, amount) {
+  if (!squadron) return { squadron, detail: 'NO SQUADRON', destroyed: false }
+  let remaining = Math.max(0, Math.round(Number(amount) || 0))
+  const nextSquadron = deepClone(squadron)
+  while (remaining > 0) {
+    const target = nextSquadron.drones.find((drone) => (drone.hull || 0) > 0 && (drone.shield || 0) > 0)
+      || nextSquadron.drones.find((drone) => (drone.hull || 0) > 0 && (drone.armour || 0) > 0)
+      || nextSquadron.drones.find((drone) => (drone.hull || 0) > 0)
+    if (!target) break
+    if ((target.shield || 0) > 0) target.shield -= 1
+    else if ((target.armour || 0) > 0) target.armour -= 1
+    else target.hull -= 1
+    remaining -= 1
+  }
+  const lost = Math.max(0, squadronAliveCount(squadron) - squadronAliveCount(nextSquadron))
+  return {
+    squadron: nextSquadron,
+    detail: `SQUADRON ${squadronAliveCount(nextSquadron)}/${DRONE_SQUADRON_SIZE} · SHIELDS ${squadronShieldCount(nextSquadron)} · ARMOUR ${squadronArmourCount(nextSquadron)}`,
+    destroyed: squadronAliveCount(nextSquadron) <= 0,
+    lost,
+  }
+}
+
+function regenerateSquadronShield(squadron) {
+  if (!squadron) return squadron
+  const nextSquadron = deepClone(squadron)
+  nextSquadron.regenTick = (nextSquadron.regenTick || 0) + 1
+  if (nextSquadron.regenTick < DRONE_REGEN_INTERVAL) return nextSquadron
+  nextSquadron.regenTick = 0
+  const drone = nextSquadron.drones.find((entry) => (entry.hull || 0) > 0 && (entry.shield || 0) <= 0)
+  if (drone) drone.shield = 1
+  return nextSquadron
+}
+
+function prepareWeaponForHexCombat(weapon, index = 0) {
+  if (!weapon) return null
+  return buildWeaponInstance(weapon.id, index, {
+    ...weapon,
+    cooldownRemaining: 0,
+    lastShotAt: 0,
+    nextShotAt: 0,
+    hexReadyIn: 0,
+    hexCooldownTurns: hexCombatWeaponCooldownTurns(weapon),
+  })
+}
+
+function decrementHexWeaponCooldowns(weapons) {
+  return (weapons || []).map((weapon) => weapon ? { ...weapon, hexReadyIn: Math.max(0, Number(weapon.hexReadyIn) || 0) - 1 } : null)
+}
+
+function activeSquadrons(combat, side) {
+  return (combat?.squadrons || []).filter((squadron) => squadron.side === side && squadronAliveCount(squadron) > 0)
+}
+
+function activeSquadron(combat, side) {
+  return activeSquadrons(combat, side)[0] || null
+}
+
+function allCombatUnits(run, side) {
+  if (!run?.combat) return []
+  const shipUnit = side === 'player' ? run.combat.playerShipUnit : run.combat.enemyShipUnit
+  return [shipUnit, ...activeSquadrons(run.combat, side)].filter(Boolean)
+}
+
+function findCombatUnit(run, unitId) {
+  if (!run?.combat || !unitId) return null
+  if (run.combat.playerShipUnit?.id === unitId) return { side: 'player', kind: 'ship', unit: run.combat.playerShipUnit }
+  if (run.combat.enemyShipUnit?.id === unitId) return { side: 'enemy', kind: 'ship', unit: run.combat.enemyShipUnit }
+  const squadron = (run.combat.squadrons || []).find((entry) => entry.id === unitId)
+  if (!squadron) return null
+  return { side: squadron.side, kind: 'squadron', unit: squadron }
+}
+
+function combatOccupiedHexes(combat, excludeUnitId = null) {
+  const occupied = []
+  if (combat?.playerShipUnit?.id !== excludeUnitId) occupied.push(...hexCombatShipFootprint(combat.playerShipUnit))
+  if (combat?.enemyShipUnit?.id !== excludeUnitId) occupied.push(...hexCombatShipFootprint(combat.enemyShipUnit))
+  ;(combat?.squadrons || []).forEach((squadron) => {
+    if (!squadron || squadron.id === excludeUnitId || squadronAliveCount(squadron) <= 0) return
+    occupied.push({ ...squadron.position })
+  })
+  return occupied
+}
+
+function hexCombatShipStepTargets(combat, side, unitOverride = null) {
+  const unit = unitOverride ? buildHexShipUnit(side, unitOverride) : (side === 'player' ? combat?.playerShipUnit : combat?.enemyShipUnit)
+  if (!unit) return []
+  return [
+    { col: unit.col + 1, row: unit.row, label: 'Advance' },
+    { col: unit.col - 1, row: unit.row, label: 'Retreat' },
+    { col: unit.col, row: unit.row - 1, label: 'Up' },
+    { col: unit.col, row: unit.row + 1, label: 'Down' },
+  ].filter((target) => {
+    const candidate = buildHexShipUnit(side, { ...unit, col: target.col, row: target.row })
+    const footprint = hexCombatShipFootprint(candidate)
+    return footprint.every((hex) => hexWithinArena(hex))
+      && footprint.every((hex) => !combatOccupiedHexes(combat, unit.id).some((occupied) => hexEquals(hex, occupied)))
+  })
+}
+
+function hexCombatShipMoveTargets(combat, side, moveBudget = null) {
+  const unit = side === 'player' ? combat?.playerShipUnit : combat?.enemyShipUnit
+  if (!unit) return []
+  const maxSteps = Math.max(0, Number(moveBudget ?? unit.actionsRemaining) || 0)
+  if (maxSteps <= 0) return []
+  const queue = [{ unit: buildHexShipUnit(side, unit), distance: 0 }]
+  const seen = new Map([[`${unit.col}:${unit.row}`, 0]])
+  const results = []
+
+  while (queue.length > 0) {
+    const current = queue.shift()
+    if (!current || current.distance >= maxSteps) continue
+    const nextSteps = hexCombatShipStepTargets(combat, side, current.unit)
+    nextSteps.forEach((target) => {
+      const distance = current.distance + 1
+      const key = `${target.col}:${target.row}`
+      if (seen.has(key) && seen.get(key) <= distance) return
+      seen.set(key, distance)
+      const candidateUnit = buildHexShipUnit(side, { ...current.unit, col: target.col, row: target.row })
+      queue.push({ unit: candidateUnit, distance })
+      results.push({
+        col: target.col,
+        row: target.row,
+        distance,
+        label: distance === 1 ? target.label : `Reposition ${distance}`,
+      })
+    })
+  }
+
+  return results.sort((a, b) => a.distance - b.distance || a.row - b.row || a.col - b.col)
+}
+
+function shipWeaponsForSide(run, side) {
+  return side === 'player' ? (run?.player?.weaponSlots || []) : (run?.combat?.enemy?.weapons || [])
+}
+
+function readyHexShipWeaponIndices(run, side) {
+  const isPlayerSide = side === 'player'
+  return shipWeaponsForSide(run, side).reduce((indices, weapon, index) => {
+    if (weaponCanFireInHexCombat(run, weapon, isPlayerSide)) indices.push(index)
+    return indices
+  }, [])
+}
+
+function combatUnitCanMove(unit) {
+  return (unit?.actionsRemaining || 0) > 0
+}
+
+function combatUnitCanAttack(run, entry) {
+  if (!entry) return false
+  if (entry.kind === 'ship') return readyHexShipWeaponIndices(run, entry.side).length > 0
+  return entry.unit?.attackAvailable !== false && squadronAliveCount(entry.unit) > 0
+}
+
+function combatUnitCanAct(run, entry) {
+  return combatUnitCanMove(entry?.unit) || combatUnitCanAttack(run, entry)
+}
+
+function combatUnitStatusLabel(run, entry) {
+  if (!entry) return 'Spent'
+  const moveLabel = combatUnitCanMove(entry.unit) ? `${entry.unit.actionsRemaining} move` : null
+  if (entry.kind === 'ship') {
+    const readyWeapons = readyHexShipWeaponIndices(run, entry.side).length
+    const fireLabel = readyWeapons > 0 ? `${readyWeapons} gun${readyWeapons === 1 ? '' : 's'} ready` : null
+    return [moveLabel, fireLabel].filter(Boolean).join(' · ') || 'Spent'
+  }
+  const strikeLabel = entry.unit?.attackAvailable !== false ? 'Strike ready' : null
+  return [moveLabel, strikeLabel].filter(Boolean).join(' · ') || 'Spent'
+}
+
+function combatUnitSummary(run, unitId) {
+  const entry = findCombatUnit(run, unitId)
+  if (!entry) return null
+  if (entry.kind === 'ship') {
+    const entity = entry.side === 'player' ? run.player : run.combat.enemy
+    return {
+      id: unitId,
+      side: entry.side,
+      kind: 'ship',
+      name: entry.side === 'player' ? run.shipName : run.combat.enemy.name,
+      subtitle: entry.side === 'player' ? run.player.shipClass : `${run.combat.enemy.kind} vessel`,
+      countLabel: '1/1',
+      canAct: combatUnitCanAct(run, entry),
+      statusLabel: combatUnitStatusLabel(run, entry),
+      hull: entity.hull,
+      hullMax: entity.hullMax,
+      shields: entity.shields,
+      shieldsMax: entity.shieldsMax,
+      armour: entity.armour,
+      armourMax: entity.armourMax || entity.armour,
+      speed: entry.side === 'player' ? playerSpeedValue(run) : entity.speed,
+      dodge: Math.round(dodgeChance(entry.side === 'player' ? run.player.maneuverability + pilotManeuverBonus(run) : entity.maneuverability) * 100),
+      stealth: entry.side === 'player' ? playerStealthValue(run) : entity.stealth,
+      unit: entry.unit,
+      weapons: entry.side === 'player' ? run.player.weaponSlots.filter(Boolean) : run.combat.enemy.weapons.filter(Boolean),
+    }
+  }
+  return {
+    id: unitId,
+    side: entry.side,
+    kind: 'squadron',
+    name: entry.side === 'player' ? 'Attack squadron Alpha' : 'Attack squadron',
+    subtitle: 'Drone squadron',
+    countLabel: `${squadronAliveCount(entry.unit)}/${DRONE_SQUADRON_SIZE}`,
+    canAct: combatUnitCanAct(run, entry),
+    statusLabel: combatUnitStatusLabel(run, entry),
+    hull: squadronAliveCount(entry.unit),
+    hullMax: DRONE_SQUADRON_SIZE,
+    shields: squadronShieldCount(entry.unit),
+    shieldsMax: DRONE_SQUADRON_SIZE,
+    armour: squadronArmourCount(entry.unit),
+    armourMax: DRONE_SQUADRON_SIZE,
+    speed: droneMoveRange(),
+    dodge: 0,
+    stealth: 0,
+    unit: entry.unit,
+    weapons: [],
+  }
+}
+
+function combatUnitSummaries(run, side) {
+  return allCombatUnits(run, side).map((unit) => combatUnitSummary(run, unit.id)).filter(Boolean)
+}
+
+function combatHangarSummaries(run, side) {
+  if (!run?.combat) return []
+  const activeCount = activeSquadrons(run.combat, side).length
+  const reserveCount = Math.max(0, (run.combat.squadronLimit || DRONE_ACTIVE_LIMIT) - activeCount)
+  return Array.from({ length: reserveCount }, (_, index) => ({
+    id: `${side}_hangar_attack_${index + 1}`,
+    side,
+    kind: 'hangar',
+    name: side === 'player' ? `Attack squadron ${String.fromCharCode(65 + index)}` : `Enemy squadron ${index + 1}`,
+    subtitle: side === 'player' ? 'Reserve attack drones' : 'Reserve hostile drones',
+    countLabel: `${DRONE_SQUADRON_SIZE}/${DRONE_SQUADRON_SIZE}`,
+    canAct: side === 'player'
+      ? ((run.combat.droneBayCooldown || 0) <= 0 && !run.combat.outcome)
+      : ((run.combat.enemyDroneBayCooldown || 0) <= 0 && !run.combat.outcome),
+    deployable: side === 'player'
+      ? ((run.combat.droneBayCooldown || 0) <= 0 && !run.combat.outcome)
+      : ((run.combat.enemyDroneBayCooldown || 0) <= 0 && !run.combat.outcome),
+    statusLabel: side === 'player'
+      ? ((run.combat.droneBayCooldown || 0) > 0 ? `Recycle ${run.combat.droneBayCooldown} turn(s)` : 'Ready')
+      : ((run.combat.enemyDroneBayCooldown || 0) > 0 ? `Recycle ${run.combat.enemyDroneBayCooldown} turn(s)` : 'Ready'),
+  }))
+}
+
+function deployHexCombatSquadron(next, side = 'player') {
+  if (!next?.combat || next.screen !== 'combat_hex' || next.combat.outcome) return { next, deployed: false, message: 'Combat unavailable.' }
+  const shipKey = side === 'player' ? 'playerShipUnit' : 'enemyShipUnit'
+  const cooldownKey = side === 'player' ? 'droneBayCooldown' : 'enemyDroneBayCooldown'
+  const label = side === 'player' ? 'Player' : 'Enemy'
+  const displayName = side === 'player' ? 'attack squadron' : 'enemy attack squadron'
+  if (activeSquadrons(next.combat, side).length >= (next.combat.squadronLimit || DRONE_ACTIVE_LIMIT)) return { next, deployed: false, message: `${label} cannot support another active squadron.` }
+  if ((next.combat[cooldownKey] || 0) > 0) return { next, deployed: false, message: `${label} drone bay is recycling.` }
+  const launchHex = hexCombatLaunchHex(side, next.combat[shipKey])
+  if (combatOccupiedHexes(next.combat).some((entry) => hexEquals(entry, launchHex))) return { next, deployed: false, message: `${label} launch corridor is blocked.` }
+  const squadron = buildAttackSquadron(side, launchHex, { actionsRemaining: 0, attackAvailable: false })
+  squadron.launchedTurn = next.combat.turnNumber || 1
+  next.combat.squadrons = [...(next.combat.squadrons || []), squadron]
+  next.combat.selectedTargetUnitId = side === 'player' ? (next.combat.enemyShipUnit?.id || null) : next.combat.selectedTargetUnitId
+  if (side === 'player') {
+    next.combat.selectedUnitId = squadron.id
+    next.combat.selectedHex = { ...squadron.position }
+  }
+  return {
+    next,
+    deployed: true,
+    squadron,
+    message: `${label}: Deployed ${displayName} (${DRONE_SQUADRON_SIZE}/${DRONE_SQUADRON_SIZE}).`,
+  }
+}
+
+function hexCombatReachableHexes(run, unitId = null) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome || run.combat.negotiation) return []
+  const selectedId = unitId || run.combat.selectedUnitId
+  const entry = findCombatUnit(run, selectedId)
+  if (!entry || entry.side !== 'player' || !combatUnitCanMove(entry.unit)) return []
+  if (entry.kind === 'ship') return hexCombatShipMoveTargets(run.combat, 'player', entry.unit.actionsRemaining).map((move) => ({ col: move.col, row: move.row, label: move.label }))
+  return Array.from({ length: HEX_ARENA.cols * HEX_ARENA.rows }, (_, index) => ({ col: index % HEX_ARENA.cols, row: Math.floor(index / HEX_ARENA.cols) }))
+    .filter((hex) => hexDistance(entry.unit.position, hex) <= (entry.unit.actionsRemaining || 0) && !hexEquals(hex, entry.unit.position) && !combatOccupiedHexes(run.combat, entry.unit.id).some((occupied) => hexEquals(occupied, hex)))
+}
+
+function setHexCombatTargetUnit(run, unitId) {
+  if (!run?.combat) return run
+  const target = findCombatUnit(run, unitId)
+  if (!target || target.side !== 'enemy') return run
+  const next = deepClone(run)
+  next.combat.selectedTargetUnitId = unitId
+  if (next.ui?.selectedCombatWeaponSide === 'player' && Number.isInteger(next.ui?.selectedCombatWeaponIndex) && next.player.weaponSlots?.[next.ui.selectedCombatWeaponIndex]) {
+    next.player.weaponSlots[next.ui.selectedCombatWeaponIndex].hexTargetUnitId = unitId
+  }
+  return next
+}
+
+function hexCombatAttackPreview(run, attackerId = null, targetId = null) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome || run.combat.negotiation) return { canAttack: false, reason: 'Combat inactive' }
+  const attacker = findCombatUnit(run, attackerId || run.combat.selectedUnitId)
+  const target = findCombatUnit(run, targetId || run.combat.selectedTargetUnitId)
+  if (!attacker || attacker.side !== 'player') return { canAttack: false, reason: 'Select a player unit' }
+  if (!target || target.side !== 'enemy') return { canAttack: false, reason: 'Select an enemy target' }
+  if (attacker.kind === 'squadron') {
+    const inRange = target.kind === 'ship' ? squadronAdjacentToShip(attacker.unit, target.unit) : hexDistance(attacker.unit.position, target.unit.position) <= 1
+    if (attacker.unit?.attackAvailable === false) return { canAttack: false, reason: 'Strike already used', attacker, target, mode: 'squadron' }
+    return {
+      canAttack: inRange,
+      reason: inRange ? 'Attack ready' : 'Out of range',
+      attacker,
+      target,
+      mode: 'squadron',
+    }
+  }
+  const selectedWeaponIndex = run.ui?.selectedCombatWeaponSide === 'player'
+    && Number.isInteger(run.ui?.selectedCombatWeaponIndex)
+    && weaponCanFireInHexCombat(run, run.player.weaponSlots?.[run.ui.selectedCombatWeaponIndex], true)
+    ? run.ui.selectedCombatWeaponIndex
+    : (run.player.weaponSlots || []).findIndex((weapon) => weaponCanFireInHexCombat(run, weapon, true))
+  if (selectedWeaponIndex < 0) return { canAttack: false, reason: 'No ready weapon', attacker, target, mode: 'ship' }
+  return {
+    canAttack: true,
+    reason: 'Attack ready',
+    attacker,
+    target,
+    mode: 'ship',
+    weaponIndex: selectedWeaponIndex,
+  }
+}
+
+function moveSelectedHexCombatUnit(run, targetHex) {
+  if (!run?.combat) return run
+  const selected = findCombatUnit(run, run.combat.selectedUnitId)
+  if (!selected || selected.side !== 'player') return run
+  if (selected.kind === 'ship') return moveHexCombatShip(run, 'player', targetHex)
+  return moveHexCombatSquadron(run, targetHex)
+}
+
+function attackSelectedHexCombatTarget(run, targetId) {
+  const targeted = setHexCombatTargetUnit(run, targetId)
+  const preview = hexCombatAttackPreview(targeted, targeted?.combat?.selectedUnitId, targetId)
+  if (!preview.canAttack) return targeted
+  if (preview.mode === 'ship') return fireHexCombatShipWeapon(targeted, preview.weaponIndex)
+  return fireHexCombatSquadron(targeted, preview.attacker.unit.id)
 }
 
 function crewXpThresholdForLevel(level) {
@@ -564,6 +1039,7 @@ function buildWeaponInstance(id, index = 0, overrides = {}) {
     broken,
     level,
     targetId: String(overrides.targetId || 'hull'),
+    hexTargetUnitId: typeof overrides.hexTargetUnitId === 'string' ? overrides.hexTargetUnitId : null,
     instanceId: overrides.instanceId || `${id}_${index}`,
   }
 }
@@ -608,6 +1084,13 @@ function weaponChargeRatio(weapon, now = Date.now()) {
   }
   if (!weapon.cooldown) return 1
   return clamp(1 - ((weapon.cooldownRemaining || 0) / weapon.cooldown), 0, 1)
+}
+
+function hexWeaponReadinessRatio(weapon) {
+  if (!weapon?.enabled || weapon.broken) return 0
+  const cooldownTurns = Math.max(1, Number(weapon.hexCooldownTurns) || hexCombatWeaponCooldownTurns(weapon))
+  const readyIn = clamp(Number(weapon.hexReadyIn) || 0, 0, cooldownTurns)
+  return clamp(1 - (readyIn / cooldownTurns), 0, 1)
 }
 
 function crewLevel(member) {
@@ -2463,10 +2946,24 @@ function toggleCombatWeaponReload(run, slotIndex) {
   return next
 }
 
-function selectCombatWeaponTargeting(run, slotIndex) {
+function selectCombatWeaponTargeting(run, slotIndex, side = 'player') {
   const next = deepClone(run)
-  next.ui.selectedCombatWeaponIndex = next.ui.selectedCombatWeaponIndex === slotIndex ? null : slotIndex
+  if (next.ui.selectedCombatWeaponIndex === slotIndex && next.ui.selectedCombatWeaponSide === side) {
+    next.ui.selectedCombatWeaponIndex = null
+  } else {
+    next.ui.selectedCombatWeaponIndex = slotIndex
+    next.ui.selectedCombatWeaponSide = side === 'enemy' ? 'enemy' : 'player'
+  }
   return next
+}
+
+function selectHexCombatWeapon(run, side, slotIndex) {
+  if (!run?.combat) return run
+  const next = deepClone(run)
+  const shipUnit = side === 'enemy' ? next.combat.enemyShipUnit : next.combat.playerShipUnit
+  next.combat.selectedUnitId = shipUnit?.id || next.combat.selectedUnitId
+  next.combat.selectedHex = shipUnit ? { ...hexCombatShipCenter(shipUnit) } : next.combat.selectedHex
+  return selectCombatWeaponTargeting(next, slotIndex, side)
 }
 
 function toggleCombatAutomation(run, key) {
@@ -2536,6 +3033,745 @@ function repairBrokenWeapon(run, slotIndex) {
   return appendLog(next, `${weapon.name} was repaired for ${cost.parts} parts and ${cost.scrap} scrap.`)
 }
 
+function awardHexCombatVictory(next) {
+  if (next.combat?.sourceNpcId) next.system.npcs = (next.system.npcs || []).filter((npc) => npc.id !== next.combat.sourceNpcId)
+  else {
+    const nodeIndex = next.system.nodes.findIndex((node) => node.id === next.currentNodeId)
+    if (nodeIndex >= 0) next.system.nodes[nodeIndex].spent = true
+  }
+  let reward = { ...(next.combat?.enemy?.reward || {}) }
+  const salvageBonus = scrapperBonus(next, 'enemy_salvage') + (next.crew || []).filter((member) => member.role === 'salvager').reduce((sum, member) => sum + Math.max(0, crewLevel(member) - 1), 0)
+  if (salvageBonus > 0) reward = { ...reward, scrap: (reward.scrap || 0) + salvageBonus }
+  const rewarded = applyReward(next, reward)
+  awardCrewXp(rewarded, 2)
+  awardCrewXp(rewarded, 1, (member) => crewSkillLevel(member, 'pilot') > 0 || crewSkillLevel(member, 'weapon_specialist') > 0)
+  rewarded.combat.outcome = {
+    kind: 'victory',
+    title: `${rewarded.combat.enemy.name} neutralized`,
+    reward,
+  }
+  return appendLog(rewarded, 'Enemy destroyed. Salvage recovered.')
+}
+
+function resolveHexCombatSource(next) {
+  if (next.combat?.sourceNpcId) next.system.npcs = (next.system.npcs || []).filter((npc) => npc.id !== next.combat.sourceNpcId)
+  else {
+    const nodeIndex = next.system.nodes.findIndex((node) => node.id === next.currentNodeId)
+    if (nodeIndex >= 0) next.system.nodes[nodeIndex].spent = true
+  }
+  return next
+}
+
+function isCombatUnitAlive(run, unitId) {
+  const entry = findCombatUnit(run, unitId)
+  if (!entry) return false
+  if (entry.kind === 'ship') return entry.side === 'player' ? (run.player.hull || 0) > 0 : (run.combat.enemy.hull || 0) > 0
+  return squadronAliveCount(entry.unit) > 0
+}
+
+function defaultHexTargetId(run, side = 'player') {
+  if (!run?.combat) return null
+  if (side === 'player') return isCombatUnitAlive(run, run.combat.enemyShipUnit?.id) ? run.combat.enemyShipUnit?.id : activeSquadron(run.combat, 'enemy')?.id || null
+  return activeSquadron(run.combat, 'player')?.id || run.combat.playerShipUnit?.id || null
+}
+
+function selectedHexTargetId(run, side = 'player') {
+  const selectedId = run?.combat?.selectedTargetUnitId
+  if (side === 'player' && selectedId && isCombatUnitAlive(run, selectedId)) {
+    const entry = findCombatUnit(run, selectedId)
+    if (entry?.side === 'enemy') return selectedId
+  }
+  return defaultHexTargetId(run, side)
+}
+
+function weaponFocusedUnitId(run, weapon, side = 'player') {
+  const targetId = weapon?.hexTargetUnitId
+  if (!targetId || !isCombatUnitAlive(run, targetId)) return null
+  const entry = findCombatUnit(run, targetId)
+  if (!entry) return null
+  if (side === 'player' && entry.side !== 'enemy') return null
+  if (side === 'enemy' && entry.side !== 'player') return null
+  return targetId
+}
+
+function selectedHexWeaponTargetId(run, weapon, side = 'player') {
+  return weaponFocusedUnitId(run, weapon, side) || selectedHexTargetId(run, side)
+}
+
+function hexWeaponFocusMarkers(run) {
+  const markers = {}
+  const register = (weapon, index, side) => {
+    const targetId = weaponFocusedUnitId(run, weapon, side)
+    if (!targetId) return
+    const bucket = markers[targetId] || { player: [], enemy: [] }
+    bucket[side].push(index + 1)
+    markers[targetId] = bucket
+  }
+  ;(run?.player?.weaponSlots || []).forEach((weapon, index) => register(weapon, index, 'player'))
+  ;(run?.combat?.enemy?.weapons || []).forEach((weapon, index) => register(weapon, index, 'enemy'))
+  return markers
+}
+
+function setHexCombatFeed(next, messages) {
+  next.combat.feed = [...messages, ...(next.combat.feed || [])].slice(0, 18)
+  return next
+}
+
+function appendHexCombatEffect(next, effect) {
+  if (!next?.combat || !effect) return next
+  next.combat.effects = [
+    {
+      id: createId('hex_fx'),
+      startedAt: Date.now(),
+      durationMs: 820,
+      ...effect,
+    },
+    ...((next.combat.effects || []).filter((entry) => entry && Date.now() - (entry.startedAt || 0) <= (entry.durationMs || 1000))),
+  ].slice(0, 12)
+  return next
+}
+
+function appendHexCombatFloaters(next, targetId, entries = []) {
+  if (!next?.combat || !targetId || !Array.isArray(entries) || entries.length === 0) return next
+  const timestamp = Date.now()
+  const fresh = entries.filter((entry) => entry?.text).map((entry, index) => ({
+    id: createId('hex_float'),
+    targetId,
+    text: entry.text,
+    colour: entry.colour || '#f8fafc',
+    startedAt: timestamp,
+    durationMs: entry.durationMs || 1050,
+    stackIndex: index,
+  }))
+  next.combat.floaters = [...fresh, ...((next.combat.floaters || []).filter((entry) => entry && timestamp - (entry.startedAt || 0) <= (entry.durationMs || 1100)))].slice(0, 24)
+  return next
+}
+
+function compactCombatWeaponLabel(weapon) {
+  if (!weapon) return 'Unknown'
+  if (weapon.id === 'Missile_I') return 'MSL'
+  if (weapon.id === 'Kinetic_I') return 'KIN'
+  if (weapon.id === 'Mining_Laser') return 'MIN'
+  return 'LAS'
+}
+
+function weaponCanFireInHexCombat(run, weapon, isPlayerSide) {
+  if (!weapon || weapon.enabled === false || weapon.broken || (weapon.hexReadyIn || 0) > 0) return false
+  if (weapon.ammoType === 'missile') return (weapon.ammoLeft || 0) > 0
+  if (weapon.ammoType) return isPlayerSide ? (run.resources[weapon.ammoType] || 0) > 0 : (weapon.ammoLeft || 0) > 0
+  return true
+}
+
+function consumeHexCombatWeaponAmmo(next, weapon, isPlayerSide) {
+  if (!weapon?.ammoType) return true
+  if (weapon.ammoType === 'missile') {
+    if ((weapon.ammoLeft || 0) <= 0) return false
+    weapon.ammoLeft = Math.max(0, (weapon.ammoLeft || 0) - 1)
+    return true
+  }
+  if (isPlayerSide) {
+    if ((next.resources[weapon.ammoType] || 0) <= 0) return false
+    next.resources[weapon.ammoType] = Math.max(0, (next.resources[weapon.ammoType] || 0) - 1)
+    return true
+  }
+  if ((weapon.ammoLeft || 0) <= 0) return false
+  weapon.ammoLeft = Math.max(0, (weapon.ammoLeft || 0) - 1)
+  return true
+}
+
+function resolveHexDamageToUnit(next, targetId, damage, shieldPen = 0.05, sourceLabel = 'Player') {
+  const target = findCombatUnit(next, targetId)
+  if (!target) return { next, message: `${sourceLabel}: no target lock was available.`, destroyed: false }
+  if (target.kind === 'ship') {
+    if (target.side === 'enemy') {
+      const before = { shields: next.combat.enemy.shields, hull: next.combat.enemy.hull }
+      const updatedEnemy = applyDamage(next.combat.enemy, damage, shieldPen, next.combat.enemy.armour || 0)
+      next.combat.enemy = { ...next.combat.enemy, ...updatedEnemy }
+      const shieldLoss = Math.max(0, before.shields - updatedEnemy.shields)
+      const hullLoss = Math.max(0, before.hull - updatedEnemy.hull)
+      appendHexCombatFloaters(next, targetId, [
+        { text: 'HIT' },
+        ...(shieldLoss > 0 ? [{ text: `SHIELDS -${shieldLoss}`, colour: '#60a5fa' }] : []),
+        ...(hullLoss > 0 ? [{ text: `HULL -${hullLoss}`, colour: '#f87171' }] : []),
+        ...(updatedEnemy.hull <= 0 ? [{ text: 'DESTROYED', colour: '#f59e0b' }] : []),
+      ])
+      return { next, message: `${sourceLabel}: hit ${next.combat.enemy.name} for ${damage} damage.`, destroyed: next.combat.enemy.hull <= 0 }
+    }
+    const before = { shields: next.player.shields, hull: next.player.hull }
+    const updatedPlayer = applyDamage({ hull: next.player.hull, shields: next.player.shields }, damage, shieldPen, next.player.armour || 0)
+    next.player.hull = updatedPlayer.hull
+    next.player.shields = updatedPlayer.shields
+    const shieldLoss = Math.max(0, before.shields - updatedPlayer.shields)
+    const hullLoss = Math.max(0, before.hull - updatedPlayer.hull)
+    appendHexCombatFloaters(next, targetId, [
+      { text: 'HIT' },
+      ...(shieldLoss > 0 ? [{ text: `SHIELDS -${shieldLoss}`, colour: '#60a5fa' }] : []),
+      ...(hullLoss > 0 ? [{ text: `HULL -${hullLoss}`, colour: '#f87171' }] : []),
+      ...(updatedPlayer.hull <= 0 ? [{ text: 'DESTROYED', colour: '#f59e0b' }] : []),
+    ])
+    return { next, message: `${sourceLabel}: hit ${next.shipName} for ${damage} damage.`, destroyed: next.player.hull <= 0 }
+  }
+  const beforeShield = squadronShieldCount(target.unit)
+  const beforeArmour = squadronArmourCount(target.unit)
+  const beforeAlive = squadronAliveCount(target.unit)
+  const result = applyDamageToSquadron(target.unit, damage)
+  next.combat.squadrons = (next.combat.squadrons || [])
+    .map((entry) => entry.id === target.unit.id ? result.squadron : entry)
+    .filter((entry) => squadronAliveCount(entry) > 0)
+  const shieldLoss = Math.max(0, beforeShield - squadronShieldCount(result.squadron))
+  const armourLoss = Math.max(0, beforeArmour - squadronArmourCount(result.squadron))
+  const destroyedDrones = Math.max(0, beforeAlive - squadronAliveCount(result.squadron))
+  appendHexCombatFloaters(next, targetId, [
+    { text: 'HIT' },
+    ...(shieldLoss > 0 ? [{ text: `SHIELDS -${shieldLoss}`, colour: '#60a5fa' }] : []),
+    ...(armourLoss > 0 ? [{ text: `ARMOUR -${armourLoss}`, colour: '#e2e8f0' }] : []),
+    ...(destroyedDrones > 0 ? [{ text: destroyedDrones > 1 ? `DRONE DESTROYED x${destroyedDrones}` : 'DRONE DESTROYED', colour: '#f59e0b' }] : []),
+  ])
+  if (target.side === 'player' && result.destroyed) next.combat.droneBayCooldown = Math.max(next.combat.droneBayCooldown || 0, 2)
+  if (target.side === 'enemy' && result.destroyed) next.combat.enemyDroneBayCooldown = Math.max(next.combat.enemyDroneBayCooldown || 0, 2)
+  return { next, message: `${sourceLabel}: struck ${target.side === 'player' ? 'your' : 'enemy'} squadron. ${result.detail}.`, destroyed: result.destroyed }
+}
+
+function paymentSummaryDetails(cost) {
+  return [
+    ...(cost.credits > 0 ? [outcomeDelta('credits', -cost.credits)] : []),
+    ...(cost.scrap > 0 ? [outcomeDelta('scrap', -cost.scrap)] : []),
+    ...(cost.parts > 0 ? [outcomeDelta('parts', -cost.parts)] : []),
+    ...(cost.fuel > 0 ? [outcomeDelta('fuel', -cost.fuel)] : []),
+  ]
+}
+
+function applyTributePayment(next, cost) {
+  next.resources.scrap = Math.max(0, next.resources.scrap - (cost.scrap || 0))
+  next.resources.parts = Math.max(0, next.resources.parts - (cost.parts || 0))
+  next.resources.credits = Math.max(0, next.resources.credits - (cost.credits || 0))
+  if ((cost.fuel || 0) > 0) spendFuel(next, cost.fuel)
+  return next
+}
+
+function selectHexCombatUnit(run, unitId) {
+  if (!run?.combat) return run
+  const entry = findCombatUnit(run, unitId)
+  if (!entry) return run
+  const next = deepClone(run)
+  if (next.combat.selectedUnitId === unitId) {
+    next.combat.selectedUnitId = null
+    next.combat.selectedHex = null
+    return next
+  }
+  next.combat.selectedUnitId = unitId
+  if (entry.side === 'enemy') next.combat.selectedTargetUnitId = unitId
+  next.combat.selectedHex = entry.kind === 'squadron' ? { ...entry.unit.position } : { ...hexCombatShipCenter(entry.unit) }
+  return next
+}
+
+function startHexCombat(run, kind, openingFeed = [], enemyOverride = null, sourceNpcId = null) {
+  const next = deepClone(run)
+  const pilot = (next.crew || []).find((member) => member.role === 'pilot')
+  const enemy = enemyOverride || buildEnemyCombatant(kind)
+  const playerMovePoints = hexCombatShipMovePoints(playerSpeedValue(next))
+  const enemyMovePoints = hexCombatShipMovePoints(enemy.speed)
+  next.player.weaponSlots = (next.player.weaponSlots || []).map((weapon, index) => weapon ? prepareWeaponForHexCombat(weapon, index) : null)
+  enemy.weapons = (enemy.weapons || []).map((weapon, index) => weapon ? prepareWeaponForHexCombat(weapon, index) : null)
+  next.screen = 'combat_hex'
+  next.combatWarning = null
+  next.ui.selectedCombatWeaponIndex = null
+  next.ui.selectedCombatWeaponSide = 'player'
+  next.ui.menuOpen = false
+  next.ui.menuPanel = 'root'
+  next.combat = {
+    mode: 'hex',
+    enemy,
+    turnNumber: 1,
+    phase: 'player',
+    feed: [...openingFeed, 'Tactical view online.', ...(pilot ? [`${pilot.name} is coordinating attack telemetry.`] : [])],
+    outcome: null,
+    sourceNpcId,
+    squadrons: [],
+    squadronLimit: DRONE_ACTIVE_LIMIT,
+    droneBayCooldown: 0,
+    enemyDroneBayCooldown: 0,
+    effects: [],
+    floaters: [],
+    selectedHex: null,
+    highlightedHexes: [],
+    selectedUnitId: 'player_ship_unit',
+    selectedTargetUnitId: 'enemy_ship_unit',
+    playerShipUnit: buildHexShipUnit('player', { actionsPerTurn: playerMovePoints, actionsRemaining: playerMovePoints }),
+    enemyShipUnit: buildHexShipUnit('enemy', { actionsPerTurn: enemyMovePoints, actionsRemaining: enemyMovePoints }),
+    negotiation: null,
+    autoCombat: false,
+  }
+  return appendLog(next, `Combat engaged with ${enemy.name}.`)
+}
+
+function launchHexCombatSquadron(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  const next = deepClone(run)
+  const deployed = deployHexCombatSquadron(next, 'player')
+  if (!deployed.deployed) return appendLog(next, deployed.message)
+  next.combat.highlightedHexes = []
+  return setHexCombatFeed(next, [deployed.message])
+}
+
+function moveHexCombatSquadron(run, targetHex) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  if (!hexWithinArena(targetHex)) return run
+  const next = deepClone(run)
+  const selected = findCombatUnit(next, next.combat.selectedUnitId)
+  const squadron = selected?.kind === 'squadron' && selected.side === 'player' ? selected.unit : activeSquadron(next.combat, 'player')
+  if (!squadron) return appendLog(next, 'No active squadron is available to move.')
+  if ((squadron.actionsRemaining || 0) <= 0) return appendLog(next, 'That squadron has no movement points left this turn.')
+  if (squadron.position.col === targetHex.col && squadron.position.row === targetHex.row) return next
+  if (combatOccupiedHexes(next.combat, squadron.id).some((entry) => hexEquals(entry, targetHex))) return appendLog(next, 'That hex is occupied.')
+  const moveCost = hexDistance(squadron.position, targetHex)
+  if (moveCost > (squadron.actionsRemaining || 0)) return appendLog(next, `Attack drones have only ${squadron.actionsRemaining || 0} movement point(s) left.`)
+  squadron.position = { ...targetHex }
+  squadron.actionsRemaining = Math.max(0, (squadron.actionsRemaining || 0) - moveCost)
+  squadron.movedThisTurn = true
+  next.combat.selectedUnitId = squadron.id
+  next.combat.selectedHex = { ...targetHex }
+  return setHexCombatFeed(next, [`Player: Attack squadron repositioned to ${targetHex.col + 1}-${targetHex.row + 1} (move -${moveCost}).`])
+}
+
+function moveHexCombatShip(run, side, target) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  const next = deepClone(run)
+  const shipKey = side === 'player' ? 'playerShipUnit' : 'enemyShipUnit'
+  const unit = next.combat[shipKey]
+  if (!unit) return next
+  if ((unit.actionsRemaining || 0) <= 0) return appendLog(next, `${side === 'player' ? 'Your' : 'Enemy'} ship has no movement points left this turn.`)
+  const valid = hexCombatShipMoveTargets(next.combat, side, unit.actionsRemaining).find((entry) => entry.col === target.col && entry.row === target.row)
+  if (!valid) return appendLog(next, 'That move is not available.')
+  next.combat[shipKey] = buildHexShipUnit(side, { ...unit, col: valid.col, row: valid.row, actionsRemaining: Math.max(0, (unit.actionsRemaining || 0) - valid.distance), movedThisTurn: true })
+  next.combat.selectedHex = { ...hexCombatShipCenter(next.combat[shipKey]) }
+  if (side === 'player') next.combat.selectedUnitId = next.combat.playerShipUnit.id
+  return setHexCombatFeed(next, [`${side === 'player' ? 'Player' : 'Enemy'}: ${side === 'player' ? next.shipName : next.combat.enemy.name} repositioned to ${valid.col + 1}-${valid.row + 1} (move -${valid.distance}).`])
+}
+
+function resolveHexCombatSquadronStrike(next, side = 'player', squadronId = null, targetIdOverride = null) {
+  const selected = squadronId ? findCombatUnit(next, squadronId) : findCombatUnit(next, next.combat.selectedUnitId)
+  const squadron = selected?.kind === 'squadron' && selected.side === side ? selected.unit : activeSquadron(next.combat, side)
+  const sourceLabel = side === 'player' ? 'Player' : 'Enemy'
+  const targetSide = side === 'player' ? 'enemy' : 'player'
+  if (!squadron) return { next, attacked: false, message: `No ${side} squadron is available.` }
+  if (squadron.attackAvailable === false) return { next, attacked: false, message: `${sourceLabel}: squadron strike already used this turn.` }
+  const targetId = targetIdOverride || selectedHexTargetId(next, side)
+  const target = findCombatUnit(next, targetId)
+  if (!target || target.side !== targetSide) return { next, attacked: false, message: `${sourceLabel}: no hostile target is selected.` }
+  const inRange = target.kind === 'ship' ? squadronAdjacentToShip(squadron, target.unit) : hexDistance(squadron.position, target.unit.position) <= 1
+  if (!inRange) return { next, attacked: false, message: `${sourceLabel}: squadron is out of range.` }
+  const volleyDamage = squadronAliveCount(squadron)
+  appendHexCombatEffect(next, { fromUnitId: squadron.id, toUnitId: targetId, kind: 'drone_laser', colour: side === 'player' ? '#bbf7d0' : '#fca5a5', hit: true })
+  const result = resolveHexDamageToUnit(next, targetId, volleyDamage, 0.05, sourceLabel)
+  squadron.attackAvailable = false
+  if (side === 'player') awardCrewXp(next, 1, (member) => crewSkillLevel(member, 'weapon_specialist') > 0)
+  return {
+    next,
+    attacked: true,
+    damage: volleyDamage,
+    message: `${sourceLabel}: Attack squadron delivered ${volleyDamage} drone-laser damage at close range.`,
+    detail: result.message,
+  }
+}
+
+function fireHexCombatSquadron(run, squadronId = null) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome || run.combat.negotiation) return run
+  const next = deepClone(run)
+  const result = resolveHexCombatSquadronStrike(next, 'player', squadronId)
+  if (!result.attacked) return appendLog(next, result.message)
+  if (next.combat.enemy.hull <= 0) {
+    setHexCombatFeed(next, [result.message, result.detail])
+    return awardHexCombatVictory(next)
+  }
+  return setHexCombatFeed(next, [result.message, result.detail])
+}
+
+function resolveHexCombatShipWeaponFire(next, side = 'player', weaponIndex, targetIdOverride = null) {
+  const isPlayerSide = side === 'player'
+  const sourceLabel = isPlayerSide ? 'Player' : 'Enemy'
+  const sourceUnitId = isPlayerSide ? next.combat.playerShipUnit?.id : next.combat.enemyShipUnit?.id
+  const weapons = shipWeaponsForSide(next, side)
+  const weapon = weapons?.[weaponIndex]
+  if (!weaponCanFireInHexCombat(next, weapon, isPlayerSide)) return { next, fired: false, message: `${sourceLabel}: that weapon is not ready.` }
+  const targetId = targetIdOverride || selectedHexWeaponTargetId(next, weapon, side)
+  const target = findCombatUnit(next, targetId)
+  if (!target || target.side !== (isPlayerSide ? 'enemy' : 'player')) return { next, fired: false, message: `${sourceLabel}: no hostile target is selected.` }
+  if (!consumeHexCombatWeaponAmmo(next, weapon, isPlayerSide)) return { next, fired: false, message: `${sourceLabel}: the weapon could not fire because it lacks ammunition.` }
+  const damage = Math.max(1, Math.round((weapon.damage || 1) * (weapon.id === 'Missile_I' ? missileDamageBonus(weapon.loadedAmmoLevel || weapon.level || 1) : 1)))
+  const shotRng = makeRng(`${next.seed}_hex_${side}_fire_${next.turn}_${next.combat.turnNumber}_${weapon.instanceId}_${targetId}`)
+  const hit = shotRng.chance(weapon.accuracy || 1)
+  appendHexCombatEffect(next, {
+    fromUnitId: sourceUnitId,
+    toUnitId: targetId,
+    kind: weapon.id === 'Missile_I' ? 'missile' : weapon.id === 'Kinetic_I' ? 'kinetic' : weapon.id === 'Mining_Laser' ? 'mining' : 'laser',
+    colour: isPlayerSide
+      ? (weapon.id === 'Missile_I' ? '#fb923c' : weapon.id === 'Kinetic_I' ? '#e2e8f0' : weapon.id === 'Mining_Laser' ? '#a78bfa' : '#67e8f9')
+      : (weapon.id === 'Missile_I' ? '#fb7185' : weapon.id === 'Kinetic_I' ? '#fecdd3' : weapon.id === 'Mining_Laser' ? '#fda4af' : '#fb7185'),
+    hit,
+  })
+  weapon.hexReadyIn = weapon.hexCooldownTurns || hexCombatWeaponCooldownTurns(weapon)
+  if (isPlayerSide) awardCrewXp(next, 1, (member) => crewSkillLevel(member, 'weapon_specialist') > 0)
+  if (!hit) {
+    appendHexCombatFloaters(next, targetId, [{ text: 'MISS', colour: '#cbd5e1' }])
+    return {
+      next,
+      fired: true,
+      targetId,
+      hit: false,
+      damage,
+      message: `${sourceLabel}: #${weaponIndex + 1} ${weapon.name} missed.`,
+    }
+  }
+  const result = resolveHexDamageToUnit(next, targetId, damage, weapon.shieldPen || 0.05, sourceLabel)
+  return {
+    next,
+    fired: true,
+    targetId,
+    hit: true,
+    damage,
+    message: `${sourceLabel}: #${weaponIndex + 1} ${weapon.name} fired for ${damage} damage.`,
+    detail: result.message,
+  }
+}
+
+function fireHexCombatShipWeapon(run, weaponIndex) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome || run.combat.negotiation) return run
+  const next = deepClone(run)
+  const result = resolveHexCombatShipWeaponFire(next, 'player', weaponIndex)
+  if (!result.fired) return appendLog(next, result.message)
+  if (next.combat.enemy.hull <= 0) {
+    setHexCombatFeed(next, [result.message, result.detail].filter(Boolean))
+    return awardHexCombatVictory(next)
+  }
+  return setHexCombatFeed(next, [result.message, result.detail].filter(Boolean))
+}
+
+function attemptHexCombatFlee(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome || run.combat.negotiation) return run
+  const next = deepClone(run)
+  if ((next.combat.playerShipUnit?.actionsRemaining || 0) <= 0) return appendLog(next, 'The ship needs movement points left to attempt a retreat.')
+  const chance = escapeChanceAgainst(next, next.combat.enemy.kind)
+  const rng = makeRng(`${next.seed}_hex_flee_${next.turn}_${next.combat.turnNumber}_${next.combat.enemy.hull}_${next.player.hull}`)
+  next.combat.playerShipUnit.actionsRemaining = 0
+  if (rng.chance(chance)) {
+    next.screen = 'map'
+    next.combat = null
+    awardCrewXp(next, 2, (member) => crewSkillLevel(member, 'pilot') > 0)
+    return setEventOutcome(
+      appendLog(next, `Fled ${ENEMIES[run.combat.enemy.kind]?.name || run.combat.enemy.name} during tactical combat.`),
+      { title: 'Combat evaded', text: 'Your ship disengaged and escaped from the tactical contact.', tone: 'green', details: [outcomeStatus('flee', 'SUCCESS')] },
+    )
+  }
+  return setHexCombatFeed(next, ['Player: Flee attempt failed. Enemy contact maintained weapons lock.'])
+}
+
+function offerHexCombatSurrender(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome || run.combat.negotiation) return run
+  const next = deepClone(run)
+  if ((next.combat.playerShipUnit?.actionsRemaining || 0) <= 0) return appendLog(next, 'The ship needs movement points left to open surrender terms.')
+  const baseCost = {
+    ...tributeDemandCost(next),
+    parts: next.combat.enemy.kind === 'patrol' ? 1 : 0,
+    credits: next.combat.enemy.kind === 'merchant' ? 12 : 0,
+  }
+  if (!playerCanPayTribute(next, baseCost)) return appendLog(next, `You cannot cover a surrender offer of ${tributeSummary(baseCost)}.`)
+  const rng = makeRng(`${next.seed}_hex_surrender_${next.turn}_${next.combat.turnNumber}_${next.combat.enemy.kind}`)
+  const acceptChance = next.combat.enemy.kind === 'patrol' ? 0.58 : next.combat.enemy.kind === 'merchant' ? 0.74 : 0.44
+  next.combat.playerShipUnit.actionsRemaining = 0
+  if (rng.chance(acceptChance)) {
+    applyTributePayment(next, baseCost)
+    next.screen = 'map'
+    next.combat = null
+    return setEventOutcome(
+      appendLog(next, `You surrendered resources and were released: ${tributeSummary(baseCost)}.`),
+      { title: 'Surrender accepted', text: 'The opposing ship accepted payment and broke contact.', tone: 'amber', details: paymentSummaryDetails(baseCost) },
+    )
+  }
+  const counterOffer = {
+    scrap: baseCost.scrap + 4,
+    parts: (baseCost.parts || 0) + 1,
+    credits: baseCost.credits + (next.combat.enemy.kind === 'patrol' ? 10 : 0),
+    fuel: (baseCost.fuel || 0) + 1,
+  }
+  next.combat.negotiation = {
+    side: 'player',
+    type: 'counteroffer',
+    cost: counterOffer,
+    text: `${next.combat.enemy.name} rejected your surrender terms and demanded ${tributeSummary(counterOffer)}.`,
+  }
+  return setHexCombatFeed(next, [`Enemy: ${next.combat.enemy.name} countered with ${tributeSummary(counterOffer)}.`])
+}
+
+function resolveHexCombatNegotiation(run, action) {
+  if (!run?.combat?.negotiation || run.screen !== 'combat_hex') return run
+  const next = deepClone(run)
+  const negotiation = next.combat.negotiation
+  if (action === 'reject') {
+    next.combat.negotiation = null
+    return setHexCombatFeed(next, [negotiation.side === 'enemy' ? 'Player: Rejected the enemy surrender offer.' : 'Player: Rejected the enemy counteroffer.'])
+  }
+  if (negotiation.side === 'enemy') {
+    resolveHexCombatSource(next)
+    const rewarded = applyReward(next, negotiation.cost || {})
+    rewarded.combat.negotiation = null
+    rewarded.combat.outcome = { kind: 'surrender', title: `${rewarded.combat.enemy.name} surrendered`, reward: negotiation.cost || {} }
+    return appendLog(rewarded, `${rewarded.combat.enemy.name} surrendered and transferred payment.`)
+  }
+  if (!playerCanPayTribute(next, negotiation.cost || {})) return appendLog(next, `You cannot pay the counteroffer: ${tributeSummary(negotiation.cost || {})}.`)
+  applyTributePayment(next, negotiation.cost || {})
+  next.screen = 'map'
+  next.combat = null
+  return setEventOutcome(
+    appendLog(next, `You paid the counteroffer and were released: ${tributeSummary(negotiation.cost || {})}.`),
+    { title: 'Counteroffer accepted', text: 'The tactical contact ended after the payment was transferred.', tone: 'amber', details: paymentSummaryDetails(negotiation.cost || {}) },
+  )
+}
+
+function nearestHexTowardTarget(start, targetHex, occupied = []) {
+  const candidates = [
+    { col: start.col + 1, row: start.row },
+    { col: start.col - 1, row: start.row },
+    { col: start.col, row: start.row + 1 },
+    { col: start.col, row: start.row - 1 },
+    { col: start.col + (start.row % 2 === 0 ? -1 : 1), row: start.row + 1 },
+    { col: start.col + (start.row % 2 === 0 ? -1 : 1), row: start.row - 1 },
+  ].filter((hex) => hexWithinArena(hex) && !occupied.some((entry) => hexEquals(entry, hex)))
+  if (candidates.length === 0) return null
+  return candidates.reduce((best, candidate) => {
+    const score = hexDistance(candidate, targetHex)
+    if (!best) return { ...candidate, score }
+    return score < best.score ? { ...candidate, score } : best
+  }, null)
+}
+
+function autoCombatShipTargetId(run, side) {
+  if (!run?.combat) return null
+  const hostileSide = side === 'player' ? 'enemy' : 'player'
+  const hostileSquadron = activeSquadron(run.combat, hostileSide)
+  const hostileShipId = hostileSide === 'enemy' ? run.combat.enemyShipUnit?.id : run.combat.playerShipUnit?.id
+  if (!hostileSquadron) return hostileShipId || null
+  const ownShip = side === 'player' ? run.combat.playerShipUnit : run.combat.enemyShipUnit
+  const squadronPressure = hexDistance(hostileSquadron.position, hexCombatShipCenter(ownShip)) <= 2
+  if (squadronPressure || !activeSquadron(run.combat, side)) return hostileSquadron.id
+  return hostileShipId || hostileSquadron.id
+}
+
+function autoCombatSquadronTargetId(run, side) {
+  if (!run?.combat) return null
+  const hostileSide = side === 'player' ? 'enemy' : 'player'
+  return activeSquadron(run.combat, hostileSide)?.id || (hostileSide === 'enemy' ? run.combat.enemyShipUnit?.id : run.combat.playerShipUnit?.id) || null
+}
+
+function chooseHexCombatShipMoveTarget(run, side, preference = 'aggressive') {
+  if (!run?.combat) return null
+  const shipUnit = side === 'player' ? run.combat.playerShipUnit : run.combat.enemyShipUnit
+  if (!shipUnit || (shipUnit.actionsRemaining || 0) <= 0) return null
+  const moveTargets = hexCombatShipMoveTargets(run.combat, side, shipUnit.actionsRemaining)
+  if (moveTargets.length === 0) return null
+  const hostileSide = side === 'player' ? 'enemy' : 'player'
+  const focusHex = activeSquadron(run.combat, hostileSide)?.position || hexCombatShipCenter(hostileSide === 'enemy' ? run.combat.enemyShipUnit : run.combat.playerShipUnit)
+  const currentScore = distanceToHexGroup(focusHex, hexCombatShipFootprint(shipUnit))
+  const bestMove = moveTargets.reduce((best, candidate) => {
+    const score = distanceToHexGroup(focusHex, hexCombatShipFootprint(buildHexShipUnit(side, { ...shipUnit, col: candidate.col, row: candidate.row })))
+    if (!best) return { ...candidate, score }
+    if (preference === 'defensive') return score > best.score ? { ...candidate, score } : best
+    return score < best.score ? { ...candidate, score } : best
+  }, null)
+  if (!bestMove) return null
+  if (preference === 'defensive' && bestMove.score <= currentScore) return null
+  if (preference !== 'defensive' && bestMove.score >= currentScore) return null
+  return bestMove
+}
+
+function resolveAutoSquadronTurn(next, side, messages) {
+  const squadron = activeSquadron(next.combat, side)
+  if (!squadron) return
+  const targetId = autoCombatSquadronTargetId(next, side)
+  const target = findCombatUnit(next, targetId)
+  if (!target) return
+  const targetHex = target.kind === 'ship' ? hexCombatShipCenter(target.unit) : target.unit.position
+  let moved = 0
+  while ((squadron.actionsRemaining || 0) > 0) {
+    const inRange = target.kind === 'ship' ? squadronAdjacentToShip(squadron, target.unit) : hexDistance(squadron.position, target.unit.position) <= 1
+    if (inRange) break
+    const move = nearestHexTowardTarget(squadron.position, targetHex, combatOccupiedHexes(next.combat, squadron.id))
+    if (!move) break
+    squadron.position = { col: move.col, row: move.row }
+    squadron.actionsRemaining = Math.max(0, (squadron.actionsRemaining || 0) - 1)
+    squadron.movedThisTurn = true
+    moved += 1
+  }
+  if (moved > 0) messages.push(`${side === 'player' ? 'Player' : 'Enemy'}: Attack squadron advanced to ${squadron.position.col + 1}-${squadron.position.row + 1} (move -${moved}).`)
+  const strike = resolveHexCombatSquadronStrike(next, side, squadron.id, targetId)
+  if (strike.attacked) {
+    messages.push(strike.message)
+    if (strike.detail) messages.push(strike.detail)
+  }
+}
+
+function resolveAutoShipTurn(next, side, messages, rng) {
+  const isPlayerSide = side === 'player'
+  const shipUnit = isPlayerSide ? next.combat.playerShipUnit : next.combat.enemyShipUnit
+  if (!shipUnit) return
+  const cooldownKey = isPlayerSide ? 'droneBayCooldown' : 'enemyDroneBayCooldown'
+  if (activeSquadrons(next.combat, side).length === 0 && (next.combat[cooldownKey] || 0) <= 0 && (isPlayerSide || rng.chance(0.62))) {
+    const deployed = deployHexCombatSquadron(next, side)
+    if (deployed.deployed) messages.push(deployed.message)
+  }
+  const preferredMove = chooseHexCombatShipMoveTarget(next, side, isPlayerSide ? 'defensive' : 'aggressive')
+  if (preferredMove) {
+    const shipKey = isPlayerSide ? 'playerShipUnit' : 'enemyShipUnit'
+    next.combat[shipKey] = buildHexShipUnit(side, {
+      ...next.combat[shipKey],
+      col: preferredMove.col,
+      row: preferredMove.row,
+      actionsRemaining: Math.max(0, (next.combat[shipKey].actionsRemaining || 0) - preferredMove.distance),
+      movedThisTurn: true,
+    })
+    messages.push(`${isPlayerSide ? 'Player' : 'Enemy'}: ${isPlayerSide ? next.shipName : next.combat.enemy.name} repositioned to ${preferredMove.col + 1}-${preferredMove.row + 1} (move -${preferredMove.distance}).`)
+  }
+  const readyWeapons = readyHexShipWeaponIndices(next, side)
+  for (const weaponIndex of readyWeapons) {
+    const targetId = autoCombatShipTargetId(next, side)
+    const result = resolveHexCombatShipWeaponFire(next, side, weaponIndex, targetId)
+    if (!result.fired) continue
+    messages.push(result.message)
+    if (result.detail) messages.push(result.detail)
+    if (isPlayerSide && next.combat.enemy.hull <= 0) return
+    if (!isPlayerSide && next.player.hull <= 0) return
+  }
+}
+
+function enemyHexCombatAttemptExit(next, messages, rng) {
+  const hullRatio = next.combat.enemy.hullMax > 0 ? next.combat.enemy.hull / next.combat.enemy.hullMax : 1
+  if (hullRatio > 0.38 || next.combat.negotiation) return false
+  if (rng.chance(0.28)) {
+    const playerScore = playerSpeedValue(next) * 0.08 + ((next.player.maneuverability || 0) + pilotManeuverBonus(next)) * 0.06 + playerStealthValue(next) * 0.08
+    const enemyScore = next.combat.enemy.speed * 0.08 + next.combat.enemy.maneuverability * 0.06 + next.combat.enemy.stealth * 0.08
+    const fleeChance = clamp(0.12 + enemyScore - playerScore, 0.05, 0.68)
+    next.combat.enemyShipUnit.actionsRemaining = 0
+    if (rng.chance(fleeChance)) {
+      resolveHexCombatSource(next)
+      next.combat.outcome = { kind: 'enemy_fled', title: `${next.combat.enemy.name} fled the field`, reward: {} }
+      messages.push(`Enemy: ${next.combat.enemy.name} disengaged and escaped.`)
+      return true
+    }
+    messages.push(`Enemy: ${next.combat.enemy.name} attempted to flee but failed.`)
+    return false
+  }
+  if (rng.chance(next.combat.enemy.kind === 'merchant' || next.combat.enemy.kind === 'civilian' ? 0.64 : 0.34)) {
+    const offer = enemyTributeOffer(next)
+    if (tributeSummary(offer)) {
+      next.combat.enemyShipUnit.actionsRemaining = 0
+      next.combat.negotiation = {
+        side: 'enemy',
+        type: 'tribute_offer',
+        cost: offer,
+        text: `${next.combat.enemy.name} is offering ${tributeSummary(offer)} to disengage.`,
+      }
+      messages.push(`Enemy: ${next.combat.enemy.name} offered ${tributeSummary(offer)} to stand down.`)
+      return true
+    }
+  }
+  return false
+}
+
+function resolveHexCombatTurn(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  if (run.combat.negotiation) return appendLog(run, 'Resolve the current surrender or counteroffer before ending the turn.')
+  const next = deepClone(run)
+  const messages = []
+  const rng = makeRng(`${next.seed}_hex_turn_${next.turn}_${next.combat.turnNumber}_${next.player.hull}_${next.combat.enemy.hull}`)
+
+  if (!enemyHexCombatAttemptExit(next, messages, rng)) {
+    resolveAutoSquadronTurn(next, 'enemy', messages)
+    if (next.player.hull > 0) resolveAutoShipTurn(next, 'enemy', messages, rng)
+  }
+
+  next.player.weaponSlots = decrementHexWeaponCooldowns(next.player.weaponSlots)
+  next.combat.enemy.weapons = decrementHexWeaponCooldowns(next.combat.enemy.weapons)
+  next.combat.squadrons = (next.combat.squadrons || []).map((entry) => regenerateSquadronShield({ ...entry, actionsPerTurn: droneMoveRange(), movedThisTurn: false, actionsRemaining: droneMoveRange(), attackAvailable: true })).filter((entry) => squadronAliveCount(entry) > 0)
+  next.combat.playerShipUnit = buildHexShipUnit('player', { ...next.combat.playerShipUnit, actionsPerTurn: next.combat.playerShipUnit?.actionsPerTurn || hexCombatShipMovePoints(playerSpeedValue(next)), actionsRemaining: next.combat.playerShipUnit?.actionsPerTurn || hexCombatShipMovePoints(playerSpeedValue(next)), attackAvailable: true, movedThisTurn: false, firedThisTurn: false })
+  next.combat.enemyShipUnit = buildHexShipUnit('enemy', { ...next.combat.enemyShipUnit, actionsPerTurn: next.combat.enemyShipUnit?.actionsPerTurn || hexCombatShipMovePoints(next.combat.enemy.speed), actionsRemaining: next.combat.enemyShipUnit?.actionsPerTurn || hexCombatShipMovePoints(next.combat.enemy.speed), attackAvailable: true, movedThisTurn: false, firedThisTurn: false })
+  next.combat.droneBayCooldown = Math.max(0, (next.combat.droneBayCooldown || 0) - 1)
+  next.combat.enemyDroneBayCooldown = Math.max(0, (next.combat.enemyDroneBayCooldown || 0) - 1)
+  next.combat.effects = (next.combat.effects || []).filter((effect) => effect && Date.now() - (effect.startedAt || 0) <= (effect.durationMs || 1000))
+  next.combat.floaters = (next.combat.floaters || []).filter((entry) => entry && Date.now() - (entry.startedAt || 0) <= (entry.durationMs || 1100))
+  next.combat.turnNumber = Math.max(1, (next.combat.turnNumber || 1) + 1)
+  const selectedEntry = findCombatUnit(next, next.combat.selectedUnitId)
+  next.combat.selectedHex = selectedEntry
+    ? (selectedEntry.kind === 'squadron' ? { ...selectedEntry.unit.position } : { ...hexCombatShipCenter(selectedEntry.unit) })
+    : null
+  next.combat.highlightedHexes = []
+  setHexCombatFeed(next, messages)
+
+  if (next.player.hull <= 0) {
+    next.screen = 'gameover'
+    next.combat = null
+    return appendLog(next, 'The player ship was destroyed in tactical combat.')
+  }
+  return next
+}
+
+function toggleHexCombatAutoCombat(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  const next = deepClone(run)
+  next.combat.autoCombat = !next.combat.autoCombat
+  return next
+}
+
+function resolveHexCombatAutoCombatStep(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  if (run.combat.negotiation?.side === 'enemy') return resolveHexCombatNegotiation(run, 'accept')
+  if (run.combat.negotiation) return toggleHexCombatAutoCombat(run)
+  const next = deepClone(run)
+  const messages = []
+  const rng = makeRng(`${next.seed}_hex_auto_player_${next.turn}_${next.combat.turnNumber}_${next.player.hull}_${next.combat.enemy.hull}`)
+  resolveAutoSquadronTurn(next, 'player', messages)
+  if (next.combat.enemy.hull <= 0) {
+    next.combat.autoCombat = false
+    setHexCombatFeed(next, messages)
+    return awardHexCombatVictory(next)
+  }
+  resolveAutoShipTurn(next, 'player', messages, rng)
+  if (next.combat.enemy.hull <= 0) {
+    next.combat.autoCombat = false
+    setHexCombatFeed(next, messages)
+    return awardHexCombatVictory(next)
+  }
+  if (messages.length > 0) setHexCombatFeed(next, messages)
+  const resolved = resolveHexCombatTurn(next)
+  if (!resolved?.combat || resolved.screen !== 'combat_hex') return resolved
+  if (resolved.combat.outcome) {
+    resolved.combat.autoCombat = false
+    return resolved
+  }
+  resolved.combat.autoCombat = true
+  return resolved
+}
+
+function autoResolveHexCombat(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome || run.combat.negotiation) return run
+  let next = deepClone(run)
+  let resolvedTurns = 0
+  while (next?.combat && next.screen === 'combat_hex' && !next.combat.outcome && next.player.hull > 0 && resolvedTurns < 30) {
+    next = resolveHexCombatAutoCombatStep({ ...next, combat: { ...next.combat, autoCombat: false } })
+    resolvedTurns += 1
+  }
+  if (next?.screen === 'gameover' || !next?.combat?.outcome) return next
+  const outcomeTitle = next.combat.outcome.title
+  const completed = continueAfterCombat(next)
+  completed.ui.eventOutcome = completed.ui.eventOutcome
+    ? {
+        ...completed.ui.eventOutcome,
+        title: 'Auto-resolve complete',
+        text: `${outcomeTitle}. Combat was resolved automatically in ${resolvedTurns} turn(s).`,
+      }
+    : completed.ui.eventOutcome
+  return appendLog(completed, `Auto-resolve completed in ${resolvedTurns} turn(s).`)
+}
+
 function startCombat(run, kind, openingFeed = [], enemyOverride = null, sourceNpcId = null) {
   const next = deepClone(run)
   awardCrewXp(next, 1)
@@ -2562,7 +3798,7 @@ function startCombat(run, kind, openingFeed = [], enemyOverride = null, sourceNp
 
 function engageCombatWarning(run) {
   if (!run?.combatWarning?.enemyKind) return run
-  return startCombat(run, run.combatWarning.enemyKind, [], run.combatWarning.enemy, run.combatWarning.sourceNpcId)
+  return startHexCombat(run, run.combatWarning.enemyKind, [], run.combatWarning.enemy, run.combatWarning.sourceNpcId)
 }
 
 function fleeCombatWarning(run) {
@@ -2579,7 +3815,7 @@ function fleeCombatWarning(run) {
       { title: 'Combat avoided', text: 'Your ship broke contact before the engagement began.', tone: 'green', details: [outcomeStatus('flee', 'SUCCESS')] },
     )
   }
-  return startCombat(appendLog(next, 'Flee attempt failed. The hostile contact closed and forced battle.'), run.combatWarning.enemyKind, ['Flee attempt failed.'], run.combatWarning.enemy, run.combatWarning.sourceNpcId)
+  return startHexCombat(appendLog(next, 'Flee attempt failed. The hostile contact closed and forced battle.'), run.combatWarning.enemyKind, ['Flee attempt failed.'], run.combatWarning.enemy, run.combatWarning.sourceNpcId)
 }
 
 function demandTributeFromEnemy(run) {
@@ -2592,7 +3828,7 @@ function demandTributeFromEnemy(run) {
   const rng = makeRng(`${next.seed}_demand_tribute_${next.turn}_${next.combatWarning.id}`)
   const acceptChance = enemy.kind === 'civilian' ? 0.76 : enemy.kind === 'merchant' ? 0.62 : enemy.kind === 'pirate' ? 0.2 : 0.34
   if (!enemyHasAnything || !rng.chance(acceptChance)) {
-    return startCombat(
+    return startHexCombat(
       appendLog(next, `${enemy.name} rejected your tribute demand.`),
       next.combatWarning.enemyKind,
       [`${enemy.name} rejected your tribute demand.`],
@@ -2632,7 +3868,7 @@ function resolveCombatDemand(run, demandId) {
   if (demandId === 'pay_tribute') {
     const cost = tributeDemandCost(next)
     if (!playerCanPayTribute(next, cost)) {
-      return startCombat(
+      return startHexCombat(
         appendLog(next, `You could not pay the demanded tribute (${tributeSummary(cost)}). Combat became unavoidable.`),
         next.combatWarning.enemyKind,
         ['Tribute payment failed.'],
@@ -3050,6 +4286,9 @@ function defaultUiState() {
     selectedNpcId: null,
     selectedWeaponSlotIndex: 0,
     selectedCombatWeaponIndex: null,
+    selectedCombatWeaponSide: 'player',
+    menuOpen: false,
+    menuPanel: 'root',
     merchantOpen: false,
     merchantContext: null,
     merchantTab: 'buy',
@@ -3084,7 +4323,7 @@ function normalizeRun(candidate) {
   const setupDefaults = defaultSetupPrefs(shipClass)
   const weaponSlotCount = Math.max(1, Number(next.player.weaponSlotsMax) || preset.weaponSlots || preset.loadout.length)
 
-  next.screen = ['map', 'combat_warning', 'combat', 'victory', 'gameover'].includes(next.screen) ? next.screen : 'map'
+  next.screen = ['map', 'combat_warning', 'combat', 'combat_hex', 'victory', 'gameover'].includes(next.screen) ? next.screen : 'map'
   next.systemIndex = Math.max(1, Number(next.systemIndex) || 1)
   next.turn = Math.max(0, Number(next.turn) || 0)
   next.log = Array.isArray(next.log) ? next.log.filter((entry) => typeof entry === 'string') : ['Save restored.']
@@ -3092,6 +4331,8 @@ function normalizeRun(candidate) {
 
   next.ui = { ...defaultUiState(), ...(next.ui || {}) }
   next.ui.mainTerminal = ['system', 'local', 'ship', 'crew', 'log'].includes(next.ui.mainTerminal) ? next.ui.mainTerminal : 'system'
+  next.ui.menuOpen = Boolean(next.ui.menuOpen)
+  next.ui.menuPanel = ['root', 'options', 'dev'].includes(next.ui.menuPanel) ? next.ui.menuPanel : 'root'
   next.ui.mapScale = clamp(Number(next.ui.mapScale) || 1, 1, 4)
   const viewSize = 360 / next.ui.mapScale
   next.ui.mapCenter = {
@@ -3244,6 +4485,7 @@ function normalizeRun(candidate) {
     : (next.ui.merchantContext && nodeIds.has(next.ui.merchantContext.id) ? { type: 'node', id: next.ui.merchantContext.id } : null)
   next.ui.selectedWeaponSlotIndex = Number.isInteger(next.ui.selectedWeaponSlotIndex) ? clamp(next.ui.selectedWeaponSlotIndex, 0, Math.max(0, next.player.weaponSlotsMax - 1)) : null
   next.ui.selectedCombatWeaponIndex = Number.isInteger(next.ui.selectedCombatWeaponIndex) ? clamp(next.ui.selectedCombatWeaponIndex, 0, Math.max(0, next.player.weaponSlotsMax - 1)) : null
+  next.ui.selectedCombatWeaponSide = next.ui.selectedCombatWeaponSide === 'enemy' ? 'enemy' : 'player'
   syncSelectedCrew(next)
 
   if (next.ui.travelAnimation) {
@@ -3271,9 +4513,73 @@ function normalizeRun(candidate) {
     }
   }
 
-  if (!next.combat?.enemy || next.screen !== 'combat') {
-    if (next.screen === 'combat') next.screen = 'map'
-    next.combat = next.screen === 'combat' ? next.combat : null
+  if (!next.combat?.enemy || !['combat', 'combat_hex'].includes(next.screen)) {
+    if (next.screen === 'combat' || next.screen === 'combat_hex') next.screen = 'map'
+    next.combat = ['combat', 'combat_hex'].includes(next.screen) ? next.combat : null
+  } else if (next.screen === 'combat_hex' || next.combat?.mode === 'hex') {
+    next.screen = 'combat_hex'
+    next.combat = {
+      ...next.combat,
+      mode: 'hex',
+      turnNumber: Math.max(1, Number(next.combat.turnNumber) || 1),
+      phase: 'player',
+      feed: Array.isArray(next.combat.feed) ? next.combat.feed.filter((entry) => typeof entry === 'string').slice(0, 18) : ['Tactical view restored.'],
+      outcome: next.combat.outcome && typeof next.combat.outcome === 'object' ? next.combat.outcome : null,
+      sourceNpcId: typeof next.combat.sourceNpcId === 'string' ? next.combat.sourceNpcId : null,
+      squadronLimit: Math.max(1, Number(next.combat.squadronLimit) || DRONE_ACTIVE_LIMIT),
+      droneBayCooldown: Math.max(0, Number(next.combat.droneBayCooldown) || 0),
+      enemyDroneBayCooldown: Math.max(0, Number(next.combat.enemyDroneBayCooldown) || 0),
+      autoCombat: Boolean(next.combat.autoCombat),
+      effects: Array.isArray(next.combat.effects) ? next.combat.effects.filter((effect) => effect && typeof effect.id === 'string').slice(0, 12) : [],
+      floaters: Array.isArray(next.combat.floaters) ? next.combat.floaters.filter((entry) => entry && typeof entry.id === 'string').slice(0, 24) : [],
+      selectedHex: next.combat.selectedHex && hexWithinArena(next.combat.selectedHex) ? { col: next.combat.selectedHex.col, row: next.combat.selectedHex.row } : null,
+      highlightedHexes: Array.isArray(next.combat.highlightedHexes) ? next.combat.highlightedHexes.filter((hex) => hex && hexWithinArena(hex)).map((hex) => ({ col: hex.col, row: hex.row })) : [],
+      selectedUnitId: next.combat.selectedUnitId === null || typeof next.combat.selectedUnitId === 'string' ? next.combat.selectedUnitId : 'player_ship_unit',
+      selectedTargetUnitId: typeof next.combat.selectedTargetUnitId === 'string' ? next.combat.selectedTargetUnitId : 'enemy_ship_unit',
+      negotiation: next.combat.negotiation && typeof next.combat.negotiation === 'object'
+        ? {
+            side: next.combat.negotiation.side === 'enemy' ? 'enemy' : 'player',
+            type: next.combat.negotiation.type || 'counteroffer',
+            cost: {
+              scrap: Math.max(0, Number(next.combat.negotiation.cost?.scrap) || 0),
+              parts: Math.max(0, Number(next.combat.negotiation.cost?.parts) || 0),
+              credits: Math.max(0, Number(next.combat.negotiation.cost?.credits) || 0),
+              fuel: Math.max(0, Number(next.combat.negotiation.cost?.fuel) || 0),
+            },
+            text: String(next.combat.negotiation.text || ''),
+          }
+        : null,
+    }
+    next.combat.enemy.hullMax = Math.max(1, Number(next.combat.enemy.hullMax) || 1)
+    next.combat.enemy.shieldsMax = Math.max(0, Number(next.combat.enemy.shieldsMax) || 0)
+    next.combat.enemy.armourMax = Math.max(0, Number(next.combat.enemy.armourMax ?? next.combat.enemy.armour) || 0)
+    next.combat.enemy.speed = Math.max(1, Number(next.combat.enemy.speed) || ENEMIES[next.combat.enemy.kind]?.speed || 1)
+    next.combat.enemy.stealth = Math.max(0, Number(next.combat.enemy.stealth) || ENEMIES[next.combat.enemy.kind]?.stealth || 0)
+    next.combat.enemy.hull = clamp(Number.isFinite(Number(next.combat.enemy.hull)) ? Number(next.combat.enemy.hull) : next.combat.enemy.hullMax, 0, next.combat.enemy.hullMax)
+    next.combat.enemy.shields = clamp(Number.isFinite(Number(next.combat.enemy.shields)) ? Number(next.combat.enemy.shields) : next.combat.enemy.shieldsMax, 0, next.combat.enemy.shieldsMax)
+    next.combat.enemy.armour = clamp(Number.isFinite(Number(next.combat.enemy.armour ?? next.combat.enemy.armourMax)) ? Number(next.combat.enemy.armour ?? next.combat.enemy.armourMax) : next.combat.enemy.armourMax, 0, next.combat.enemy.armourMax)
+    next.combat.enemy.weapons = normalizeWeaponInstances(next.combat.enemy.weapons, ENEMIES[next.combat.enemy.kind]?.loadout || []).map((weapon, index) => weapon ? prepareWeaponForHexCombat(weapon, index) : null)
+    next.combat.enemy.crew = Array.isArray(next.combat.enemy.crew) ? next.combat.enemy.crew.map((member) => ({ ...member, healthMax: Math.max(1, Number(member.healthMax) || 10), health: clamp(Number.isFinite(Number(member.health)) ? Number(member.health) : (Number(member.healthMax) || 10), 0, Math.max(1, Number(member.healthMax) || 10)) })) : buildEnemyCrew(next.combat.enemy.kind)
+    next.player.weaponSlots = next.player.weaponSlots.map((weapon, index) => weapon ? prepareWeaponForHexCombat(weapon, index) : null)
+    next.combat.playerShipUnit = buildHexShipUnit('player', { ...(next.combat.playerShipUnit || {}), actionsPerTurn: hexCombatShipMovePoints(playerSpeedValue(next)) })
+    next.combat.enemyShipUnit = buildHexShipUnit('enemy', { ...(next.combat.enemyShipUnit || {}), actionsPerTurn: hexCombatShipMovePoints(next.combat.enemy.speed) })
+    next.combat.squadrons = Array.isArray(next.combat.squadrons) ? next.combat.squadrons.map((squadron) => ({
+      ...squadron,
+      position: hexWithinArena(squadron.position || {}) ? { col: squadron.position.col, row: squadron.position.row } : hexCombatLaunchHex(squadron.side || 'player', squadron.side === 'player' ? next.combat.playerShipUnit : next.combat.enemyShipUnit),
+      drones: Array.isArray(squadron.drones) ? squadron.drones.filter((drone) => drone && typeof drone === 'object').map((drone) => ({
+        shield: clamp(Number(drone.shield) || 0, 0, 1),
+        armour: clamp(Number(drone.armour) || 0, 0, 1),
+        hull: clamp(Number(drone.hull) || 0, 0, 1),
+      })) : Array.from({ length: DRONE_SQUADRON_SIZE }, () => buildDroneUnit()),
+      actionsPerTurn: droneMoveRange(),
+      actionsRemaining: clamp(Number.isFinite(Number(squadron.actionsRemaining)) ? Number(squadron.actionsRemaining) : droneMoveRange(), 0, droneMoveRange()),
+      attackAvailable: squadron.attackAvailable !== false,
+      movedThisTurn: Boolean(squadron.movedThisTurn),
+      regenTick: Math.max(0, Number(squadron.regenTick) || 0),
+      launchedTurn: Math.max(0, Number(squadron.launchedTurn) || 0),
+    })).filter((squadron) => squadronAliveCount(squadron) > 0) : []
+    if (next.combat.selectedUnitId && !isCombatUnitAlive(next, next.combat.selectedUnitId)) next.combat.selectedUnitId = next.combat.playerShipUnit.id
+    if (!isCombatUnitAlive(next, next.combat.selectedTargetUnitId)) next.combat.selectedTargetUnitId = next.combat.enemyShipUnit.id
   } else {
     next.combat.speed = [0, 2, 4, 6].includes(next.combat.speed) ? next.combat.speed : 2
     next.combat.feed = Array.isArray(next.combat.feed) ? next.combat.feed.filter((entry) => typeof entry === 'string').slice(0, 18) : ['Combat resumed.']
@@ -3460,6 +4766,56 @@ function dismissEventOutcome(run) {
   const next = deepClone(run)
   next.ui.eventOutcome = null
   return next
+}
+
+function setMenuOpen(run, menuOpen) {
+  const next = deepClone(run)
+  next.ui.menuOpen = menuOpen
+  if (!menuOpen) next.ui.menuPanel = 'root'
+  return next
+}
+
+function setMenuPanel(run, menuPanel) {
+  const next = deepClone(run)
+  next.ui.menuOpen = true
+  next.ui.menuPanel = menuPanel
+  return next
+}
+
+function devGrantResources(run) {
+  const next = deepClone(run)
+  next.resources.scrap += 40
+  next.resources.parts += 20
+  next.resources.credits += 150
+  addFuel(next, 8)
+  return appendLog(next, 'Developer option: granted scrap, parts, credits, and fuel.')
+}
+
+function devRestoreShip(run) {
+  const next = deepClone(run)
+  next.player.hull = next.player.hullMax
+  next.player.shields = next.player.shieldsMax
+  next.player.armour = next.player.armourMax
+  next.player.weaponSlots = (next.player.weaponSlots || []).map((weapon, index) => weapon ? buildWeaponInstance(weapon.id, index, { ...weapon, hp: weapon.maxHp, broken: false, enabled: true }) : null)
+  next.crew = (next.crew || []).map((member) => ({ ...member, health: member.healthMax || 12 }))
+  return appendLog(next, 'Developer option: restored ship, weapons, and crew.')
+}
+
+function devForceCombatVictory(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  const next = deepClone(run)
+  next.combat.enemy.hull = 0
+  next.combat.feed = ['Developer: Forced combat victory.', ...(next.combat.feed || [])].slice(0, 18)
+  return awardHexCombatVictory(next)
+}
+
+function abandonRunToMenu(setRun) {
+  try {
+    localStorage.removeItem(MASTER.saveKey)
+  } catch {
+    // ignore storage errors
+  }
+  setRun(null)
 }
 
 function toggleLegend(run) {
@@ -3938,6 +5294,18 @@ function ActionButton({ children, onClick, disabled = false, tone = 'slate' }) {
   return <button className={`w-full rounded-2xl px-4 py-3 text-sm font-semibold transition ${disabled ? 'bg-slate-900 text-slate-500' : tones[tone]}`} onClick={onClick} disabled={disabled}>{children}</button>
 }
 
+function MiniActionButton({ children, onClick, disabled = false, active = false }) {
+  return (
+    <button
+      className={`rounded-full px-3 py-1.5 text-[11px] font-semibold transition ${disabled ? 'bg-slate-900 text-slate-500' : active ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      {children}
+    </button>
+  )
+}
+
 function TerminalTab({ active, onClick, children }) {
   return <button className={`flex-1 rounded-xl px-2 py-2 text-xs font-semibold ${active ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`} onClick={onClick}>{children}</button>
 }
@@ -4198,11 +5566,11 @@ function ShipSystemsPanel({
   )
 }
 
-function CombatShipSilhouette({ x, y, mirrored = false, accent = '#38bdf8', shieldRatio = 0, now = 0 }) {
+function CombatShipSilhouette({ x, y, mirrored = false, accent = '#38bdf8', shieldRatio = 0, now = 0, scale = 1 }) {
   const flameOpacity = 0.5 + ((Math.sin(now / 140) + 1) / 2) * 0.35
   return (
     <g transform={`translate(${x} ${y})`}>
-      <g transform={mirrored ? 'scale(-1 1)' : undefined}>
+      <g transform={`${mirrored ? 'scale(-1 1)' : 'scale(1 1)'} scale(${scale})`}>
         <circle r="46" fill="none" stroke={accent} strokeWidth="7" opacity={0.14 + shieldRatio * 0.5} />
         <circle r="31" fill="none" stroke={accent} strokeWidth="2.5" opacity={0.18 + shieldRatio * 0.35} />
         <path d="M -36 8 L -14 -4 L -14 18 L -30 22 Z" fill="#64748b" stroke="#0f172a" strokeWidth="2" />
@@ -4295,6 +5663,385 @@ function CombatScene({ player, enemy, shots = [], now, playerLabel }) {
   )
 }
 
+function hexArenaCenter(col, row, size) {
+  return {
+    x: Math.sqrt(3) * size * (col + 0.5 * (row & 1)),
+    y: size * 1.5 * row,
+  }
+}
+
+function hexArenaPolygon(center, size) {
+  return Array.from({ length: 6 }, (_, index) => {
+    const angle = ((60 * index) - 30) * (Math.PI / 180)
+    return `${center.x + size * Math.cos(angle)},${center.y + size * Math.sin(angle)}`
+  }).join(' ')
+}
+
+function TacticalBullseye({ x, y, colour = '#ef4444' }) {
+  return (
+    <g pointerEvents="none">
+      <circle cx={x} cy={y} r="15" fill="none" stroke={colour} strokeWidth="2.6" />
+      <circle cx={x} cy={y} r="6.5" fill="none" stroke={colour} strokeWidth="2.2" />
+      <line x1={x - 21} y1={y} x2={x - 10} y2={y} stroke={colour} strokeWidth="2.1" />
+      <line x1={x + 10} y1={y} x2={x + 21} y2={y} stroke={colour} strokeWidth="2.1" />
+      <line x1={x} y1={y - 21} x2={x} y2={y - 10} stroke={colour} strokeWidth="2.1" />
+      <line x1={x} y1={y + 10} x2={x} y2={y + 21} stroke={colour} strokeWidth="2.1" />
+    </g>
+  )
+}
+
+function HexCombatArena({
+  run,
+  onHexClick,
+  onSelectUnit,
+  onTargetUnit,
+  onAttackUnit,
+  onHoverUnit,
+  hoveredUnitId,
+  now,
+}) {
+  const combat = run.combat
+  const size = HEX_ARENA.size
+  const boardOffset = { x: 142, y: 54 }
+  const boardWidth = Math.sqrt(3) * size * (HEX_ARENA.cols + 0.5)
+  const boardHeight = size * 1.5 * Math.max(0, HEX_ARENA.rows - 1) + size * 2
+  const viewWidth = boardOffset.x * 2 + boardWidth
+  const viewHeight = boardOffset.y * 2 + boardHeight
+  const selectedEntry = combat.selectedUnitId ? findCombatUnit(run, combat.selectedUnitId) : null
+  const hoveredEntry = hoveredUnitId ? findCombatUnit(run, hoveredUnitId) : null
+  const playerShipFootprint = hexCombatShipFootprint(combat.playerShipUnit)
+  const enemyShipFootprint = hexCombatShipFootprint(combat.enemyShipUnit)
+  const selectedHex = selectedEntry
+    ? (selectedEntry.kind === 'squadron' ? selectedEntry.unit.position : hexCombatShipCenter(selectedEntry.unit))
+    : null
+  const toPixel = (hex) => {
+    const center = hexArenaCenter(hex.col, hex.row, size)
+    return { x: center.x + boardOffset.x, y: center.y + boardOffset.y }
+  }
+  const shipAnchor = (unit) => {
+    const points = hexCombatShipFootprint(unit).map((hex) => toPixel(hex))
+    const sum = points.reduce((acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }), { x: 0, y: 0 })
+    return { x: sum.x / Math.max(1, points.length), y: sum.y / Math.max(1, points.length) }
+  }
+  const playerShip = shipAnchor(combat.playerShipUnit)
+  const enemyShip = shipAnchor(combat.enemyShipUnit)
+  const playerLabel = run.shipName
+  const playerShieldRatio = run.player.shieldsMax ? run.player.shields / run.player.shieldsMax : 0
+  const reachable = new Set(hexCombatReachableHexes(run, combat.selectedUnitId).map((hex) => `${hex.col}:${hex.row}`))
+  const hoverAttackPreview = hoveredEntry?.side === 'enemy' && selectedEntry?.side === 'player' ? hexCombatAttackPreview(run, combat.selectedUnitId, hoveredUnitId) : null
+  const bullseyeHex = hoveredEntry?.side === 'enemy' && selectedEntry?.side === 'player'
+    ? (hoveredEntry.kind === 'ship' ? hexCombatShipCenter(hoveredEntry.unit) : hoveredEntry.unit.position)
+    : null
+  const activeEffects = (combat.effects || []).filter((effect) => now - (effect.startedAt || 0) <= (effect.durationMs || 800))
+  const activeFloaters = (combat.floaters || []).filter((entry) => now - (entry.startedAt || 0) <= (entry.durationMs || 1100))
+  const focusMarkers = hexWeaponFocusMarkers(run)
+  const effectEndpoints = (effect) => {
+    const fromEntry = findCombatUnit(run, effect.fromUnitId)
+    const toEntry = findCombatUnit(run, effect.toUnitId)
+    if (!fromEntry || !toEntry) return null
+    const fromPoint = fromEntry.kind === 'ship' ? shipAnchor(fromEntry.unit) : toPixel(fromEntry.unit.position)
+    const toPoint = toEntry.kind === 'ship' ? shipAnchor(toEntry.unit) : toPixel(toEntry.unit.position)
+    return { from: fromPoint, to: toPoint }
+  }
+  const unitAnchor = (entry) => (entry?.kind === 'ship' ? shipAnchor(entry.unit) : toPixel(entry.unit.position))
+  const handleUnitClick = (unitId) => {
+    const entry = findCombatUnit(run, unitId)
+    if (!entry) return
+    const activeSelection = findCombatUnit(run, combat.selectedUnitId)
+    if (entry.side === 'enemy' && activeSelection?.side === 'player') {
+      const preview = hexCombatAttackPreview(run, activeSelection.unit.id, unitId)
+      if (preview.canAttack) onAttackUnit?.(unitId)
+      else onTargetUnit?.(unitId)
+      return
+    }
+    onSelectUnit?.(unitId)
+  }
+
+  return (
+    <div className="rounded-3xl border border-slate-800 bg-slate-950/80 p-3">
+      <svg viewBox={`0 0 ${viewWidth} ${viewHeight}`} className="w-full rounded-2xl bg-[#020617]" onMouseLeave={() => onHoverUnit?.(null)}>
+        <defs>
+          <linearGradient id="hexLane" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.65" />
+            <stop offset="100%" stopColor="#ef4444" stopOpacity="0.65" />
+          </linearGradient>
+          <clipPath id="playerShipClip">
+            {playerShipFootprint.map((hex) => <polygon key={`player_clip_${hex.col}_${hex.row}`} points={hexArenaPolygon(toPixel(hex), size - 4)} />)}
+          </clipPath>
+          <clipPath id="enemyShipClip">
+            {enemyShipFootprint.map((hex) => <polygon key={`enemy_clip_${hex.col}_${hex.row}`} points={hexArenaPolygon(toPixel(hex), size - 4)} />)}
+          </clipPath>
+        </defs>
+        <rect x="0" y="0" width={viewWidth} height={viewHeight} fill="#020617" />
+        {Array.from({ length: 22 }, (_, index) => (
+          <circle
+            key={`hex_star_${index}`}
+            cx={24 + ((index * 53) % Math.max(80, Math.round(viewWidth - 48)))}
+            cy={18 + ((index * 37) % Math.max(60, Math.round(viewHeight - 36)))}
+            r={index % 3 === 0 ? 1.5 : 1}
+            fill="#cbd5e1"
+            opacity={0.2 + (index % 5) * 0.08}
+          />
+        ))}
+        <line x1={playerShip.x + 30} y1={playerShip.y} x2={enemyShip.x - 30} y2={enemyShip.y} stroke="url(#hexLane)" strokeWidth="2" strokeDasharray="10 8" opacity="0.32" />
+
+        {Array.from({ length: HEX_ARENA.rows }, (_, row) => (
+          Array.from({ length: HEX_ARENA.cols }, (_, col) => {
+            const center = hexArenaCenter(col, row, size)
+            const absoluteCenter = { x: center.x + boardOffset.x, y: center.y + boardOffset.y }
+            const hexKey = `${col}:${row}`
+            const isSelected = selectedHex && selectedHex.col === col && selectedHex.row === row
+            const isReachable = reachable.has(hexKey)
+            return (
+              <g key={hexKey}>
+                <polygon
+                  points={hexArenaPolygon(absoluteCenter, size - 1.2)}
+                  fill={isSelected ? 'rgba(251,191,36,0.28)' : isReachable ? 'rgba(34,197,94,0.22)' : 'rgba(15,23,42,0.88)'}
+                  stroke={isSelected ? '#fbbf24' : isReachable ? '#4ade80' : '#334155'}
+                  strokeWidth="1.3"
+                />
+                {isReachable ? (
+                  <polygon
+                    points={hexArenaPolygon(absoluteCenter, size + 1.5)}
+                    fill="rgba(0,0,0,0)"
+                    stroke="transparent"
+                    strokeWidth="8"
+                    className="cursor-pointer"
+                    onClick={() => onHexClick?.({ col, row })}
+                  />
+                ) : null}
+                <text x={absoluteCenter.x} y={absoluteCenter.y + 4} textAnchor="middle" fill="#475569" fontSize="9" pointerEvents="none">{col + 1}-{row + 1}</text>
+              </g>
+            )
+          })
+        ))}
+
+        {playerShipFootprint.map((hex) => {
+          const center = toPixel(hex)
+          const selected = combat.selectedUnitId === combat.playerShipUnit?.id
+          const hovered = hoveredUnitId === combat.playerShipUnit?.id
+          return (
+            <polygon
+              key={`player_ship_hex_${hex.col}_${hex.row}`}
+              points={hexArenaPolygon(center, hovered ? size - 2.5 : size - 4)}
+              fill="rgba(56,189,248,0.24)"
+              stroke={hovered ? '#67e8f9' : selected ? '#22d3ee' : '#0891b2'}
+              strokeWidth={hovered || selected ? '3.6' : '1.8'}
+              onClick={() => handleUnitClick(combat.playerShipUnit.id)}
+              onMouseEnter={() => onHoverUnit?.(combat.playerShipUnit.id)}
+              onMouseLeave={() => onHoverUnit?.(null)}
+              className="cursor-pointer"
+            />
+          )
+        })}
+        {enemyShipFootprint.map((hex) => {
+          const center = toPixel(hex)
+          const selected = combat.selectedUnitId === combat.enemyShipUnit?.id
+          const targeted = combat.selectedTargetUnitId === combat.enemyShipUnit?.id
+          const hovered = hoveredUnitId === combat.enemyShipUnit?.id
+          return (
+            <polygon
+              key={`enemy_ship_hex_${hex.col}_${hex.row}`}
+              points={hexArenaPolygon(center, hovered ? size - 2.5 : size - 4)}
+              fill="rgba(239,68,68,0.22)"
+              stroke={hovered ? '#fecaca' : selected ? '#fca5a5' : targeted ? '#fbbf24' : '#ef4444'}
+              strokeWidth={hovered || selected || targeted ? '3.6' : '1.8'}
+              strokeDasharray={targeted ? '6 4' : undefined}
+              onClick={() => handleUnitClick(combat.enemyShipUnit.id)}
+              onMouseEnter={() => onHoverUnit?.(combat.enemyShipUnit.id)}
+              onMouseLeave={() => onHoverUnit?.(null)}
+              className="cursor-pointer"
+            />
+          )
+        })}
+
+        <g clipPath="url(#playerShipClip)">
+          <CombatShipSilhouette x={playerShip.x} y={playerShip.y} accent="#38bdf8" shieldRatio={playerShieldRatio} now={now} scale={0.72} />
+        </g>
+        <g clipPath="url(#enemyShipClip)">
+          <CombatShipSilhouette x={enemyShip.x} y={enemyShip.y} accent={combat.enemy.kind === 'patrol' ? '#fb7185' : '#ef4444'} shieldRatio={combat.enemy.shieldsMax ? combat.enemy.shields / combat.enemy.shieldsMax : 0} now={now + 180} mirrored scale={0.72} />
+        </g>
+
+        {(combat.squadrons || []).filter((entry) => squadronAliveCount(entry) > 0).map((squadron) => {
+          const absoluteCenter = toPixel(squadron.position)
+          const alive = aliveSquadronDrones(squadron)
+          const ring = 11
+          const dots = alive.map((_, index) => {
+            const angle = (Math.PI * 2 * index) / Math.max(alive.length, 1)
+            return {
+              x: absoluteCenter.x + Math.cos(angle) * ring,
+              y: absoluteCenter.y + Math.sin(angle) * ring,
+            }
+          })
+          const selected = combat.selectedUnitId === squadron.id
+          const targeted = combat.selectedTargetUnitId === squadron.id
+          const hovered = hoveredUnitId === squadron.id
+          return (
+            <g
+              key={squadron.id}
+              onClick={() => handleUnitClick(squadron.id)}
+              onMouseEnter={() => onHoverUnit?.(squadron.id)}
+              onMouseLeave={() => onHoverUnit?.(null)}
+              className="cursor-pointer"
+            >
+              {selected || hovered ? <polygon points={hexArenaPolygon(absoluteCenter, hovered ? size + 4.5 : size + 3)} fill="none" stroke={squadron.side === 'player' ? (hovered ? '#67e8f9' : '#22d3ee') : (hovered ? '#fecaca' : '#fca5a5')} strokeWidth="3.4" /> : null}
+              {targeted ? <polygon points={hexArenaPolygon(absoluteCenter, size + 1)} fill="none" stroke="#fbbf24" strokeWidth="2.2" strokeDasharray="5 4" /> : null}
+              <circle cx={absoluteCenter.x} cy={absoluteCenter.y} r={hovered ? '20' : '18'} fill="#0f172a" stroke="#22c55e" strokeWidth="2.2" />
+              {dots.map((dot, index) => <circle key={`drone_dot_${index}`} cx={dot.x} cy={dot.y} r="3.2" fill="#bbf7d0" stroke="#14532d" strokeWidth="1" />)}
+              <circle cx={absoluteCenter.x} cy={absoluteCenter.y} r="6.5" fill="#16a34a" />
+              <text x={absoluteCenter.x} y={absoluteCenter.y + 3.5} textAnchor="middle" fill="#f8fafc" fontSize="9" fontWeight="700">{alive.length}</text>
+            </g>
+          )
+        })}
+
+        {Object.entries(focusMarkers).map(([unitId, marker]) => {
+          const entry = findCombatUnit(run, unitId)
+          if (!entry) return null
+          const anchor = unitAnchor(entry)
+          const playerText = marker.player.length > 0 ? `P${marker.player.join(',')}` : ''
+          const enemyText = marker.enemy.length > 0 ? `E${marker.enemy.join(',')}` : ''
+          return (
+            <g key={`focus_${unitId}`} pointerEvents="none">
+              {playerText ? (
+                <g transform={`translate(${anchor.x - 18} ${anchor.y - 26})`}>
+                  <circle cx="0" cy="0" r="12" fill="#fbbf24" opacity="0.92" />
+                  <text x="0" y="4" textAnchor="middle" fill="#111827" fontSize="8" fontWeight="700">{playerText}</text>
+                </g>
+              ) : null}
+              {enemyText ? (
+                <g transform={`translate(${anchor.x + 18} ${anchor.y - 26})`}>
+                  <circle cx="0" cy="0" r="12" fill="#fb7185" opacity="0.92" />
+                  <text x="0" y="4" textAnchor="middle" fill="#111827" fontSize="8" fontWeight="700">{enemyText}</text>
+                </g>
+              ) : null}
+            </g>
+          )
+        })}
+
+        {activeEffects.map((effect) => {
+          const endpoints = effectEndpoints(effect)
+          if (!endpoints) return null
+          const progress = clamp((now - effect.startedAt) / Math.max(1, effect.durationMs || 820), 0, 1)
+          const x = endpoints.from.x + ((endpoints.to.x - endpoints.from.x) * progress)
+          const y = endpoints.from.y + ((endpoints.to.y - endpoints.from.y) * progress)
+          if (effect.kind === 'missile') {
+            const direction = endpoints.to.x >= endpoints.from.x ? 1 : -1
+            const points = direction === 1 ? `${x},${y} ${x - 12},${y - 5} ${x - 12},${y + 5}` : `${x},${y} ${x + 12},${y - 5} ${x + 12},${y + 5}`
+            return (
+              <g key={effect.id} opacity={1 - progress * 0.2} pointerEvents="none">
+                <line x1={endpoints.from.x} y1={endpoints.from.y} x2={x - direction * 10} y2={y} stroke={effect.colour} strokeWidth="2.4" opacity="0.55" />
+                <polygon points={points} fill={effect.colour} />
+                {progress > 0.88 ? <circle cx={endpoints.to.x} cy={endpoints.to.y} r="9" fill={effect.colour} opacity="0.35" /> : null}
+              </g>
+            )
+          }
+          if (effect.kind === 'kinetic') {
+            return (
+              <g key={effect.id} opacity={1 - progress * 0.24} pointerEvents="none">
+                <line x1={x - 8} y1={y} x2={x} y2={y} stroke={effect.colour} strokeWidth="2.2" />
+                <circle cx={x} cy={y} r="3.2" fill={effect.colour} />
+                {progress > 0.92 ? <circle cx={endpoints.to.x} cy={endpoints.to.y} r="5" fill={effect.colour} opacity="0.45" /> : null}
+              </g>
+            )
+          }
+          return (
+            <g key={effect.id} opacity={1 - progress * 0.18} pointerEvents="none">
+              <line x1={endpoints.from.x} y1={endpoints.from.y} x2={x} y2={y} stroke={effect.colour} strokeWidth={effect.kind === 'mining' ? 3 : 2.2} strokeDasharray={effect.kind === 'mining' ? '6 4' : undefined} />
+              {progress > 0.86 ? <circle cx={endpoints.to.x} cy={endpoints.to.y} r="6" fill={effect.colour} opacity="0.45" /> : null}
+            </g>
+          )
+        })}
+
+        {activeFloaters.map((floater) => {
+          const entry = findCombatUnit(run, floater.targetId)
+          if (!entry) return null
+          const anchor = unitAnchor(entry)
+          const progress = clamp((now - floater.startedAt) / Math.max(1, floater.durationMs || 1100), 0, 1)
+          const yOffset = 18 + (floater.stackIndex || 0) * 16 + progress * 18
+          return (
+            <text
+              key={floater.id}
+              x={anchor.x}
+              y={anchor.y - yOffset}
+              textAnchor="middle"
+              fill={floater.colour}
+              fontSize="12"
+              fontWeight="700"
+              opacity={1 - progress * 0.9}
+              pointerEvents="none"
+            >
+              {floater.text}
+            </text>
+          )
+        })}
+
+        {bullseyeHex ? <TacticalBullseye x={toPixel(bullseyeHex).x} y={toPixel(bullseyeHex).y} colour={hoverAttackPreview?.canAttack ? '#ef4444' : '#94a3b8'} /> : null}
+      </svg>
+    </div>
+  )
+}
+
+function TacticalSquadView({ title, units, accent = 'cyan', selectedUnitId, hoveredUnitId, onSelect, onHover, emptyLabel = 'No units listed.' }) {
+  const accentClass = accent === 'rose'
+    ? 'border-rose-800 bg-rose-950/15'
+    : accent === 'mixed'
+      ? 'border-slate-800 bg-slate-950/35'
+      : 'border-cyan-800 bg-cyan-950/15'
+  return (
+    <div className={`rounded-2xl border p-2.5 ${accentClass}`}>
+      {title ? <div className="text-[10px] uppercase tracking-[0.2em] text-slate-400">{title}</div> : null}
+      <div className={`${title ? 'mt-2' : ''} flex flex-wrap gap-2`}>
+        {units.length === 0 ? <div className="rounded-2xl border border-dashed border-slate-700/80 px-3 py-4 text-xs text-slate-500">{emptyLabel}</div> : null}
+        {units.map((unit) => (
+          <button
+            key={unit.id}
+            type="button"
+            className={`relative flex min-w-[88px] items-center gap-2 rounded-2xl border px-2.5 py-2 text-left ${unit.id === selectedUnitId ? 'border-amber-400 bg-amber-500/15' : hoveredUnitId === unit.id ? 'border-slate-400 bg-slate-900/75' : unit.side === 'enemy' ? 'border-rose-900/70 bg-rose-950/10' : 'border-cyan-900/70 bg-cyan-950/10'} ${unit.canAct ? 'text-slate-100' : 'opacity-45'}`}
+            onClick={() => onSelect?.(unit.id)}
+            onMouseEnter={() => onHover?.(unit.id)}
+            onMouseLeave={() => onHover?.(null)}
+          >
+            <div className={`flex h-9 w-9 items-center justify-center rounded-xl text-[11px] font-bold ${unit.side === 'enemy' ? 'bg-rose-500 text-slate-950' : 'bg-cyan-500 text-slate-950'}`}>
+              {unit.kind === 'ship' ? 'SH' : unit.kind === 'hangar' ? 'HG' : 'DR'}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-xs font-semibold">{unit.name}</div>
+              <div className="text-[10px] uppercase tracking-[0.16em] text-slate-400">{unit.statusLabel || (unit.canAct ? 'Ready' : 'Spent')}</div>
+            </div>
+            <div className="absolute right-2 top-1 rounded-full bg-slate-950/90 px-1.5 py-0.5 text-[10px] font-semibold text-slate-100">{unit.countLabel}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function TacticalHangarView({ title, units, onDeploy }) {
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-950/35 p-2.5">
+      {title ? <div className="text-[10px] uppercase tracking-[0.2em] text-slate-400">{title}</div> : null}
+      <div className={`${title ? 'mt-2' : ''} grid gap-2`}>
+        {units.length === 0 ? <div className="rounded-2xl border border-dashed border-slate-700/80 px-3 py-4 text-xs text-slate-500">No units waiting.</div> : null}
+        {units.map((unit) => (
+          <div key={unit.id} className={`rounded-2xl border p-2.5 ${unit.side === 'enemy' ? 'border-rose-900/70 bg-rose-950/10' : 'border-cyan-900/70 bg-cyan-950/10'}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-xs font-semibold text-slate-100">{unit.name}</div>
+                <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{unit.subtitle}</div>
+              </div>
+              <div className="rounded-full bg-slate-950/90 px-2 py-1 text-[10px] font-semibold text-slate-100">{unit.countLabel}</div>
+            </div>
+            <div className="mt-2 text-[11px] text-slate-400">{unit.statusLabel}</div>
+            <div className="mt-2">
+              <ActionButton tone={unit.side === 'player' && unit.deployable ? 'green' : 'slate'} disabled={unit.side !== 'player' || !unit.deployable} onClick={() => onDeploy?.(unit.id)}>Deploy</ActionButton>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function CargoGrid({ cargoCapacity, entries, selectedCargoItemId, onSelect, onDragStartItem, onDropCell }) {
   const slots = Array.from({ length: cargoCapacity }, (_, index) => entries[index] || null)
   return (
@@ -4360,6 +6107,7 @@ function WeaponSlotGrid({ slots, selectedSlotIndex, onSelect, onDragStartSlot, o
 
 function CombatCrewStrip({ crew, selectedCrewId, onSelect }) {
   const selectedCrew = (crew || []).find((member) => member.id === selectedCrewId) || crew?.[0] || null
+  const nextLevelXp = selectedCrew ? xpToNextCrewLevel(selectedCrew) : 0
   return (
     <div className="grid gap-3">
       <div className="rounded-2xl border border-cyan-900/70 bg-slate-950/70 p-3">
@@ -4377,7 +6125,7 @@ function CombatCrewStrip({ crew, selectedCrewId, onSelect }) {
             <div className="mt-3 grid grid-cols-2 gap-2">
               <MiniStat label="Trait" value={selectedCrew.trait} tone="slate" />
               <MiniStat label="Health" value={`${selectedCrew.health || 0} / ${selectedCrew.healthMax || 0}`} tone="rose" />
-              <MiniStat label="Next level" value={`${8 - crewXpIntoLevel(selectedCrew)} xp`} tone="cyan" />
+              <MiniStat label="Next level" value={nextLevelXp > 0 ? `${nextLevelXp} xp` : 'MAX'} tone="cyan" />
             </div>
           </div>
         ) : (
@@ -4396,7 +6144,14 @@ function CombatCrewStrip({ crew, selectedCrewId, onSelect }) {
             </div>
             <div className="mt-2 h-2 overflow-hidden rounded-full border border-rose-900/70 bg-slate-950"><div className="h-full rounded-full bg-rose-500" style={{ width: `${((member.health || 0) / Math.max(1, member.healthMax || 1)) * 100}%` }} /></div>
             <div className="mt-2 h-2 overflow-hidden rounded-full border border-slate-700 bg-slate-950">
-              <div className="h-full rounded-full bg-cyan-400" style={{ width: `${(crewXpIntoLevel(member) / 8) * 100}%` }} />
+              <div className="h-full rounded-full bg-cyan-400" style={{ width: `${(() => {
+                const currentLevel = crewLevel(member)
+                if (currentLevel >= CREW_LEVEL_THRESHOLDS.length) return 100
+                const previousThreshold = crewXpThresholdForLevel(currentLevel)
+                const nextThreshold = crewXpThresholdForLevel(currentLevel + 1)
+                const span = Math.max(1, nextThreshold - previousThreshold)
+                return clamp((((member.xp || 0) - previousThreshold) / span) * 100, 0, 100)
+              })()}%` }} />
             </div>
             <div className="mt-1 text-[10px] text-slate-500">{member.trait}</div>
           </button>
@@ -4406,10 +6161,56 @@ function CombatCrewStrip({ crew, selectedCrewId, onSelect }) {
   )
 }
 
+function RunMenu({ run, setRun }) {
+  if (!run) return null
+  const menuPanel = run.ui?.menuPanel || 'root'
+  return (
+    <div className="fixed right-4 top-4 z-50">
+      <div className="flex justify-end">
+        <button
+          type="button"
+          className="rounded-2xl border border-slate-700 bg-slate-900/95 px-4 py-2 text-sm font-semibold text-slate-100 shadow-xl"
+          onClick={() => setRun((prev) => setMenuOpen(prev, !prev.ui?.menuOpen))}
+        >
+          Menu
+        </button>
+      </div>
+      {run.ui?.menuOpen ? (
+        <div className="mt-3 w-80 rounded-3xl border border-slate-700 bg-slate-950/95 p-4 shadow-2xl backdrop-blur">
+          <div className="flex items-center justify-between gap-3 border-b border-slate-800 pb-3">
+            <div className="text-xs uppercase tracking-[0.22em] text-slate-400">Run menu</div>
+            {menuPanel !== 'root' ? <button type="button" className="rounded-xl bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-100" onClick={() => setRun((prev) => setMenuPanel(prev, 'root'))}>Back</button> : null}
+          </div>
+          {menuPanel === 'root' ? (
+            <div className="mt-4 grid gap-2">
+              <ActionButton onClick={() => setRun((prev) => setMenuPanel(prev, 'options'))}>Options</ActionButton>
+              <ActionButton tone="amber" onClick={() => setRun((prev) => setMenuPanel(prev, 'dev'))}>Options dev</ActionButton>
+              <ActionButton tone="rose" onClick={() => abandonRunToMenu(setRun)}>Self destruct</ActionButton>
+            </div>
+          ) : null}
+          {menuPanel === 'options' ? (
+            <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-300">
+              Player-configurable options will go here.
+            </div>
+          ) : null}
+          {menuPanel === 'dev' ? (
+            <div className="mt-4 grid gap-2">
+              <ActionButton tone="amber" onClick={() => setRun((prev) => devGrantResources(prev))}>Grant Resources</ActionButton>
+              <ActionButton tone="amber" onClick={() => setRun((prev) => devRestoreShip(prev))}>Restore Ship</ActionButton>
+              <ActionButton tone="amber" disabled={run.screen !== 'combat_hex' || Boolean(run.combat?.outcome)} onClick={() => setRun((prev) => devForceCombatVictory(prev))}>Force Combat Victory</ActionButton>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 export default function STLSynthesisedGame() {
   const [run, setRun] = useState(null)
   const [setup, setSetup] = useState(defaultSetupPrefs())
   const [now, setNow] = useState(Date.now())
+  const [hoveredCombatUnitId, setHoveredCombatUnitId] = useState(null)
   const mapFrameRef = useRef(null)
   const mapGestureRef = useRef({ mode: null, moved: false, startScale: 1, startCenter: { x: 180, y: 180 }, startTouch: { x: 0, y: 0 }, startDistance: 0, startMidpoint: { x: 0, y: 0 } })
 
@@ -4467,6 +6268,17 @@ export default function STLSynthesisedGame() {
     const id = window.setTimeout(() => setRun((prev) => finalizeTravelAnimation(prev)), run.ui.travelAnimation.durationMs)
     return () => window.clearTimeout(id)
   }, [run?.ui?.travelAnimation])
+
+  useEffect(() => {
+    if (run?.screen === 'combat_hex' && hoveredCombatUnitId && isCombatUnitAlive(run, hoveredCombatUnitId)) return
+    if (hoveredCombatUnitId) setHoveredCombatUnitId(null)
+  }, [run?.screen, run?.combat, hoveredCombatUnitId])
+
+  useEffect(() => {
+    if (!run || run.screen !== 'combat_hex' || !run.combat?.autoCombat || run.combat.outcome) return undefined
+    const id = window.setTimeout(() => setRun((prev) => resolveHexCombatAutoCombatStep(prev)), 420)
+    return () => window.clearTimeout(id)
+  }, [run?.screen, run?.combat?.autoCombat, run?.combat?.turnNumber, run?.combat?.outcome, run?.combat?.negotiation, run?.combat?.selectedUnitId, run?.combat?.playerShipUnit?.actionsRemaining, run?.combat?.enemyShipUnit?.actionsRemaining])
 
   useEffect(() => {
     if (!run || run.screen !== 'combat' || !run.combat || run.combat.speed <= 0 || run.combat.outcome) return undefined
@@ -4760,6 +6572,7 @@ export default function STLSynthesisedGame() {
     const canDemandTribute = warningEnemy.kind !== 'patrol' && Boolean(outgoingTributeText)
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
+        <RunMenu run={run} setRun={setRun} />
         <div className="mx-auto w-full max-w-6xl">
           <div className="grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_360px]">
             <div className="rounded-3xl border border-amber-700 bg-slate-900 p-4 shadow-2xl">
@@ -4823,9 +6636,289 @@ export default function STLSynthesisedGame() {
     )
   }
 
+  if (run.screen === 'combat_hex' && run.combat) {
+    const playerUnits = combatUnitSummaries(run, 'player')
+    const enemyUnits = combatUnitSummaries(run, 'enemy')
+    const playerHangarUnits = combatHangarSummaries(run, 'player')
+    const enemyHangarUnits = combatHangarSummaries(run, 'enemy')
+    const selectedUnit = run.combat.selectedUnitId ? combatUnitSummary(run, run.combat.selectedUnitId) : null
+    const selectedWeaponIndex = Number.isInteger(run.ui.selectedCombatWeaponIndex) ? run.ui.selectedCombatWeaponIndex : null
+    const selectedWeaponSide = run.ui.selectedCombatWeaponSide === 'enemy' ? 'enemy' : 'player'
+    const playerWeaponEntries = run.player.weaponSlots.map((weapon, index) => weapon ? { weapon, index } : null).filter(Boolean)
+    const enemyWeaponEntries = run.combat.enemy.weapons.map((weapon, index) => weapon ? { weapon, index } : null).filter(Boolean)
+    const selectedShipWeapon = selectedUnit?.kind === 'ship' && selectedWeaponIndex !== null && selectedWeaponSide === selectedUnit.side
+      ? ((selectedUnit.side === 'player' ? run.player.weaponSlots?.[selectedWeaponIndex] : run.combat.enemy.weapons?.[selectedWeaponIndex]) || null)
+      : null
+    const selectedShipWeaponOwner = selectedShipWeapon ? (selectedWeaponSide === 'player' ? run.shipName : run.combat.enemy.name) : null
+    const selectedTarget = selectedShipWeapon
+      ? combatUnitSummary(run, selectedHexWeaponTargetId(run, selectedShipWeapon, selectedWeaponSide))
+      : (combatUnitSummary(run, run.combat.selectedTargetUnitId) || enemyUnits[0] || null)
+    const selectedAttackPreview = selectedUnit?.side === 'player' && selectedTarget
+      ? hexCombatAttackPreview(run, selectedUnit.id, selectedTarget.id)
+      : { canAttack: false, reason: 'Select a player unit' }
+    const selectedMoveHexes = selectedUnit?.side === 'player' ? hexCombatReachableHexes(run, selectedUnit.id) : []
+    const selectedSquadronCanAttack = selectedUnit?.kind === 'squadron' && selectedAttackPreview.canAttack
+    const selectedShieldTotal = selectedUnit ? (selectedUnit.kind === 'ship' ? shieldLayerCount({ shieldsMax: selectedUnit.shieldsMax, shields: selectedUnit.shields }) : Math.max(0, selectedUnit.shieldsMax || 0)) : 0
+    const selectedShieldFilled = selectedUnit ? (selectedUnit.kind === 'ship' ? chargedShieldLayers({ shieldsMax: selectedUnit.shieldsMax, shields: selectedUnit.shields }) : Math.max(0, selectedUnit.shields || 0)) : 0
+    const negotiation = run.combat.negotiation
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
+        <RunMenu run={run} setRun={setRun} />
+        <div className="mx-auto w-full max-w-7xl">
+          <div className="rounded-3xl border border-amber-700 bg-slate-900 p-3 shadow-2xl">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase tracking-[0.25em] text-amber-300">Tactical view</div>
+                <div className="mt-1 text-xl font-bold">{run.shipName} vs {run.combat.enemy.name}</div>
+                <div className="text-xs text-slate-400">Turn {run.combat.turnNumber}</div>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-[200px_minmax(0,1fr)_200px]">
+              <div className="rounded-2xl border border-cyan-800 bg-cyan-950/10 p-2.5">
+                <div className="text-sm font-semibold text-cyan-100">{run.shipName}</div>
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${(run.player.hull / Math.max(1, run.player.hullMax)) * 100}%` }} /></div>
+                <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-slate-400">
+                  <span>SPD {playerSpeedValue(run)}</span>
+                  <span>DDG {Math.round(dodgeChance(run.player.maneuverability + pilotManeuverBonus(run)) * 100)}%</span>
+                  <span>STL {playerStealthValue(run)}</span>
+                </div>
+                <div className="mt-2 grid gap-2">
+                  <LayerPips label="Sh" total={shieldLayerCount({ shieldsMax: run.player.shieldsMax, shields: run.player.shields })} filled={chargedShieldLayers({ shieldsMax: run.player.shieldsMax, shields: run.player.shields })} activeColour="#3b82f6" />
+                  <LayerPips label="Ar" total={Math.max(0, run.player.armourMax || run.player.armour)} filled={Math.max(0, run.player.armour || 0)} activeColour="#f8fafc" />
+                </div>
+                <div className="mt-2 grid gap-2">
+                  {playerWeaponEntries.map(({ weapon, index }) => {
+                    const isSelected = selectedWeaponSide === 'player' && selectedWeaponIndex === index
+                    return (
+                      <button key={weapon.instanceId} type="button" className={`rounded-xl border px-2 py-1.5 text-left ${isSelected ? 'border-amber-500 bg-amber-950/20' : 'border-cyan-900/70 bg-slate-950/55'}`} onClick={() => setRun((prev) => selectHexCombatWeapon(prev, 'player', index))}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-semibold text-slate-100">#{index + 1} {compactCombatWeaponLabel(weapon)}</span>
+                          <span className="text-[10px] text-slate-400">{weapon.ammoType ? weaponAmmoCount(run, weapon, true) : '∞'}</span>
+                        </div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(weapon) * 100}%` }} /></div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-cyan-400" style={{ width: `${hexWeaponReadinessRatio(weapon) * 100}%` }} /></div>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <HexCombatArena
+                run={run}
+                onHexClick={(hex) => setRun((prev) => moveSelectedHexCombatUnit(prev, hex))}
+                onSelectUnit={(unitId) => setRun((prev) => selectHexCombatUnit(prev, unitId))}
+                onTargetUnit={(unitId) => setRun((prev) => setHexCombatTargetUnit(prev, unitId))}
+                onAttackUnit={(unitId) => setRun((prev) => attackSelectedHexCombatTarget(prev, unitId))}
+                onHoverUnit={setHoveredCombatUnitId}
+                hoveredUnitId={hoveredCombatUnitId}
+                now={now}
+              />
+
+              <div className="rounded-2xl border border-rose-800 bg-rose-950/10 p-2.5">
+                <div className="text-sm font-semibold text-rose-100">{run.combat.enemy.name}</div>
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${(run.combat.enemy.hull / Math.max(1, run.combat.enemy.hullMax)) * 100}%` }} /></div>
+                <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-slate-400">
+                  <span>SPD {run.combat.enemy.speed}</span>
+                  <span>DDG {Math.round(dodgeChance(run.combat.enemy.maneuverability) * 100)}%</span>
+                  <span>STL {run.combat.enemy.stealth}</span>
+                </div>
+                <div className="mt-2 grid gap-2">
+                  <LayerPips label="Sh" total={shieldLayerCount({ shieldsMax: run.combat.enemy.shieldsMax, shields: run.combat.enemy.shields })} filled={chargedShieldLayers({ shieldsMax: run.combat.enemy.shieldsMax, shields: run.combat.enemy.shields })} activeColour="#3b82f6" />
+                  <LayerPips label="Ar" total={Math.max(0, run.combat.enemy.armourMax || run.combat.enemy.armour)} filled={Math.max(0, run.combat.enemy.armour || 0)} activeColour="#f8fafc" />
+                </div>
+                <div className="mt-2 grid gap-2">
+                  {enemyWeaponEntries.map(({ weapon, index }) => {
+                    const isSelected = selectedWeaponSide === 'enemy' && selectedWeaponIndex === index
+                    return (
+                      <button key={weapon.instanceId} type="button" className={`rounded-xl border px-2 py-1.5 text-left ${isSelected ? 'border-amber-500 bg-amber-950/20' : 'border-rose-900/70 bg-slate-950/55'}`} onClick={() => setRun((prev) => selectHexCombatWeapon(prev, 'enemy', index))}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-semibold text-slate-100">#{index + 1} {compactCombatWeaponLabel(weapon)}</span>
+                          <span className="text-[10px] text-slate-400">{weapon.ammoType ? weaponAmmoCount(run, weapon, false) : '∞'}</span>
+                        </div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(weapon) * 100}%` }} /></div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-cyan-400" style={{ width: `${hexWeaponReadinessRatio(weapon) * 100}%` }} /></div>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
+            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Active units</div>
+            <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_150px_minmax(0,1fr)]">
+              <TacticalSquadView title="Player" units={playerUnits} accent="cyan" selectedUnitId={run.combat.selectedUnitId} hoveredUnitId={hoveredCombatUnitId} onSelect={(unitId) => setRun((prev) => selectHexCombatUnit(prev, unitId))} onHover={setHoveredCombatUnitId} emptyLabel="No player units." />
+              <div className="flex flex-col items-center justify-center gap-2">
+                {run.combat.outcome ? <ActionButton tone="green" onClick={() => setRun((prev) => continueAfterCombat(prev))}>Continue</ActionButton> : <ActionButton tone="amber" onClick={() => setRun((prev) => resolveHexCombatTurn(prev))}>End turn</ActionButton>}
+                {!run.combat.outcome ? (
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <MiniActionButton disabled={Boolean(run.combat.negotiation)} onClick={() => setRun((prev) => autoResolveHexCombat(prev))}>auto-resolve</MiniActionButton>
+                    <MiniActionButton active={Boolean(run.combat.autoCombat)} disabled={Boolean(run.combat.negotiation && run.combat.negotiation.side !== 'enemy')} onClick={() => setRun((prev) => toggleHexCombatAutoCombat(prev))}>auto-combat</MiniActionButton>
+                  </div>
+                ) : null}
+              </div>
+              <TacticalSquadView title="Enemy" units={enemyUnits} accent="rose" selectedUnitId={run.combat.selectedUnitId} hoveredUnitId={hoveredCombatUnitId} onSelect={(unitId) => setRun((prev) => selectHexCombatUnit(prev, unitId))} onHover={setHoveredCombatUnitId} emptyLabel="No enemy units." />
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
+            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Hangar view</div>
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
+              <TacticalHangarView title="Player" units={playerHangarUnits} onDeploy={() => setRun((prev) => launchHexCombatSquadron(prev))} />
+              <TacticalHangarView title="Enemy" units={enemyHangarUnits} onDeploy={() => {}} />
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
+            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Unit view</div>
+            {selectedUnit ? (
+              <div className="mt-3">
+                {selectedUnit.kind === 'ship' ? (
+                  selectedShipWeapon ? (
+                    <div className="rounded-2xl border border-slate-800 bg-slate-950/45 p-2.5">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold">#{selectedWeaponIndex + 1} {selectedShipWeapon.name}</div>
+                          <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{selectedShipWeaponOwner} · {selectedWeaponSide === 'player' ? 'Player weapon' : 'Enemy weapon'}</div>
+                        </div>
+                        <div className="text-xs text-slate-400">{selectedShipWeapon.ammoType ? `${selectedWeaponSide === 'player' ? weaponAmmoCount(run, selectedShipWeapon, true) : weaponAmmoCount(run, selectedShipWeapon, false)} ${ammoUnitsLabel(selectedShipWeapon.ammoType)}` : 'No ammo required'}</div>
+                      </div>
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+                        <MiniStat label="Damage" value={selectedShipWeapon.damage} tone="amber" />
+                        <MiniStat label="Accuracy" value={`${Math.round((selectedShipWeapon.accuracy || 0) * 100)}%`} tone="cyan" />
+                        <MiniStat label="Target" value={selectedTarget?.name || 'None'} tone="amber" />
+                        <MiniStat label="Readiness" value={selectedShipWeapon.hexReadyIn > 0 ? `${selectedShipWeapon.hexReadyIn} turn(s)` : 'Ready'} tone={selectedShipWeapon.hexReadyIn > 0 ? 'slate' : 'green'} />
+                        <MiniStat label="Ammo" value={selectedShipWeapon.ammoType ? (selectedWeaponSide === 'player' ? weaponAmmoCount(run, selectedShipWeapon, true) : weaponAmmoCount(run, selectedShipWeapon, false)) : '∞'} tone="amber" />
+                      </div>
+                      <div className="mt-3 h-2 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(selectedShipWeapon) * 100}%` }} /></div>
+                      <div className="mt-2 h-2 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-cyan-400" style={{ width: `${hexWeaponReadinessRatio(selectedShipWeapon) * 100}%` }} /></div>
+                      <div className="mt-2 text-xs text-slate-300">{EQUIPMENT_CATALOG[selectedShipWeapon.id]?.description || 'Ship-mounted weapon system.'}</div>
+                      {selectedWeaponSide === 'player' && !run.combat.outcome ? (
+                        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                          <ActionButton tone="amber" onClick={() => setRun((prev) => selectHexCombatWeapon(prev, 'player', selectedWeaponIndex))}>Keep tactical click on this weapon</ActionButton>
+                          <ActionButton tone="cyan" disabled={!weaponCanFireInHexCombat(run, selectedShipWeapon, true) || !selectedTarget} onClick={() => setRun((prev) => fireHexCombatShipWeapon(prev, selectedWeaponIndex))}>Fire at {selectedTarget?.name || 'target'}</ActionButton>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className="rounded-2xl border border-dashed border-slate-700/80 px-4 py-4 text-sm text-slate-400">Select a ship weapon from the side panel to inspect it here.</div>
+                  )
+                ) : (
+                  <>
+                    <div className="rounded-2xl border border-slate-800 bg-slate-950/45 p-2.5">
+                      <div className="flex flex-col gap-4 lg:flex-row">
+                        <div className="rounded-2xl border border-slate-700 bg-slate-950 p-2">
+                          <svg viewBox="0 0 72 72" className="h-20 w-20">
+                            <circle cx="36" cy="36" r="22" fill="#0f172a" stroke="#22c55e" strokeWidth="3" />
+                            {Array.from({ length: Math.max(1, squadronAliveCount(selectedUnit.unit)) }, (_, index) => {
+                              const angle = (Math.PI * 2 * index) / Math.max(1, squadronAliveCount(selectedUnit.unit))
+                              return <circle key={`detail_drone_${index}`} cx={36 + Math.cos(angle) * 16} cy={36 + Math.sin(angle) * 16} r="4" fill="#bbf7d0" stroke="#14532d" strokeWidth="1" />
+                            })}
+                            <circle cx="36" cy="36" r="7" fill="#16a34a" />
+                          </svg>
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-semibold">{selectedUnit.name}</div>
+                              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{selectedUnit.subtitle}</div>
+                            </div>
+                            <div className="text-xs text-slate-400">{selectedUnit.side === 'player' ? 'Player unit' : 'Enemy unit'}</div>
+                          </div>
+                          <div className="mt-3 grid gap-2 sm:grid-cols-3 xl:grid-cols-6">
+                            <MiniStat label="Count" value={selectedUnit.countLabel} tone="amber" />
+                            <MiniStat label="Status" value={selectedUnit.statusLabel || (selectedUnit.canAct ? 'Ready' : 'Spent')} tone={selectedUnit.canAct ? 'green' : 'slate'} />
+                            <MiniStat label="Speed" value={selectedUnit.speed} tone="green" />
+                            <MiniStat label="Dodge" value="Close range" tone="cyan" />
+                            <MiniStat label="Target" value={selectedTarget?.name || 'None'} tone="amber" />
+                            <MiniStat label="Move hexes" value={selectedMoveHexes.length} tone="green" />
+                          </div>
+                          <div className="mt-3 h-2 overflow-hidden rounded-full border border-slate-700 bg-slate-950">
+                            <div className="h-full rounded-full bg-emerald-400" style={{ width: `${((selectedUnit.hull || 0) / Math.max(1, selectedUnit.hullMax || 1)) * 100}%` }} />
+                          </div>
+                          <div className="mt-3 grid gap-3 md:grid-cols-2">
+                            <LayerPips label="Shields" total={selectedShieldTotal} filled={selectedShieldFilled} activeColour="#3b82f6" />
+                            <LayerPips label="Armour" total={Math.max(0, selectedUnit.armourMax || 0)} filled={Math.max(0, selectedUnit.armour || 0)} activeColour="#f8fafc" />
+                          </div>
+                          {selectedUnit.side === 'player' ? (
+                            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                              <MiniStat label="Action preview" value={selectedAttackPreview.canAttack ? 'Attack ready' : selectedAttackPreview.reason} tone={selectedAttackPreview.canAttack ? 'rose' : 'slate'} />
+                              <MiniStat label="Grid action" value="Move and strike" tone="amber" />
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+
+                    {selectedUnit.side === 'player' && !run.combat.outcome ? (
+                      <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_300px]">
+                        <div className="rounded-2xl border border-emerald-800 bg-emerald-950/10 p-2.5">
+                          <div className="text-xs uppercase tracking-[0.18em] text-emerald-300">Drone action</div>
+                          <div className="mt-2 text-xs text-slate-300">Move on the grid, then strike in the same turn. Hover a hostile for a red or grey bulls-eye, then click to attack.</div>
+                          <div className="mt-3">
+                            <ActionButton tone="green" disabled={!selectedSquadronCanAttack} onClick={() => setRun((prev) => fireHexCombatSquadron(prev, selectedUnit.id))}>Attack {selectedTarget?.name || 'target'}</ActionButton>
+                          </div>
+                        </div>
+
+                        <div className="grid gap-3">
+                          <div className="rounded-2xl border border-slate-800 bg-slate-950/45 p-2.5">
+                            <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Unit actions</div>
+                            <div className="mt-2 text-xs text-slate-300">Attack drones have {selectedUnit.unit.actionsRemaining || 0} movement point(s) left this turn and can still strike adjacent hostile units, including the enemy ship.</div>
+                            <div className="mt-3 grid gap-2">
+                              <ActionButton tone={selectedSquadronCanAttack ? 'green' : 'slate'} disabled={!selectedSquadronCanAttack} onClick={() => setRun((prev) => fireHexCombatSquadron(prev, selectedUnit.id))}>Confirm attack on {selectedTarget?.name || 'target'}</ActionButton>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="mt-3 text-sm text-slate-400">No tactical unit is selected. Click a ship, squadron, or ship weapon in the tactical view.</div>
+            )}
+          </div>
+
+          <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
+            <div className="grid content-start gap-3">
+              {negotiation ? (
+                <div className="rounded-3xl border border-amber-800 bg-amber-950/20 p-3">
+                  <div className="text-xs uppercase tracking-[0.2em] text-amber-300">Combat negotiation</div>
+                  <div className="mt-2 text-sm text-slate-200">{negotiation.text}</div>
+                  <div className="mt-3 grid gap-2">
+                    <ActionButton tone="green" onClick={() => setRun((prev) => resolveHexCombatNegotiation(prev, 'accept'))}>{negotiation.side === 'enemy' ? 'Accept surrender' : 'Pay counteroffer'}</ActionButton>
+                    <ActionButton tone="rose" onClick={() => setRun((prev) => resolveHexCombatNegotiation(prev, 'reject'))}>{negotiation.side === 'enemy' ? 'Reject and continue' : 'Reject counteroffer'}</ActionButton>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
+                <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Combat feed</div>
+                <div className="mt-3 grid max-h-[260px] gap-2 overflow-auto pr-1 text-sm text-slate-300">
+                  {run.combat.feed.map((entry, index) => {
+                    const meta = classifyCombatFeedEntry(entry)
+                    return <div key={`${entry}_${index}`} className={`rounded-2xl border px-3 py-2 ${meta.tone}`}><div className="flex items-start justify-between gap-3"><div className="text-sm">{entry}</div><div className="text-[10px] uppercase tracking-[0.18em] opacity-70">{meta.badge}</div></div></div>
+                  })}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
+              <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Crew stations</div>
+              <div className="mt-3"><CombatCrewStrip crew={run.crew} selectedCrewId={run.ui.selectedCrewId} onSelect={(crewId) => setRun((prev) => selectCrewMember(prev, crewId))} /></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   if (run.screen === 'combat' && run.combat) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
+        <RunMenu run={run} setRun={setRun} />
         <div className="mx-auto w-full max-w-6xl">
           <div className="grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_360px]">
             <div className="rounded-3xl border border-amber-700 bg-slate-900 p-4 shadow-2xl">
@@ -4994,6 +7087,7 @@ export default function STLSynthesisedGame() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
+      <RunMenu run={run} setRun={setRun} />
       <div className="mx-auto w-full max-w-7xl">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 shadow-2xl overflow-hidden">
           <div className="grid gap-3 p-3 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
@@ -5288,7 +7382,6 @@ export default function STLSynthesisedGame() {
             </div>
 
               <div className="rounded-3xl border-2 border-violet-700 bg-violet-950/10 p-4 shadow-lg"><div className="text-xs uppercase tracking-[0.24em] text-violet-300 border-b border-violet-800/50 pb-3">tertiary terminal</div><div className="mt-3 grid gap-3"><div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3"><div className="text-xs uppercase tracking-[0.2em] text-slate-400">System telemetry</div><div className="mt-2 grid grid-cols-2 gap-2"><MiniStat label="Turn" value={run.turn} tone="green" /><MiniStat label="System" value={`${run.systemIndex} / ${MASTER.maxSystems}`} tone="cyan" /><MiniStat label="Current node" value={current.label} tone="slate" /><MiniStat label="Selected" value={selectedTravelTarget?.label || 'None'} tone="slate" /></div>{selectedTravelTarget ? <div className="mt-3 text-xs text-slate-300">Route cost {selectedTravelTarget.id === current.id ? 0 : fuelCostForDistance(run, nodeDistance(run.system, current, selectedTravelTarget), selectedTravelMode === 'travel' ? 'travel' : selectedTravelMode)} fuel · police {Math.round((selectedRouteRisk?.policeChance || 0) * 100)}% · pirates {Math.round((selectedRouteRisk?.pirateChance || 0) * 100)}%</div> : null}</div>{meteorPath ? <div className="rounded-2xl border border-amber-800 bg-amber-950/20 p-3"><div className="text-sm font-semibold text-amber-200">Interplanetary meteor stream</div><div className="mt-1 text-sm text-slate-300">{meteorPath.description}</div></div> : <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3 text-sm text-slate-300">No major system-wide events are currently active.</div>}<div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3"><div className="text-xs uppercase tracking-[0.2em] text-slate-400">Crew capability</div><div className="mt-3 grid gap-2">{run.crew.length === 0 ? <div className="text-sm text-slate-400">No crew remain aboard.</div> : run.crew.map((member) => <div key={member.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/45 px-3 py-2"><div><div className="text-sm font-semibold">{member.name}</div><div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{crewRoleLabel(member.role)}</div></div><div className="text-right"><div className="text-xs text-cyan-200">Lv {crewLevel(member)}</div><div className="text-[10px] text-slate-500">{member.xp} xp</div></div></div>)}</div></div></div></div>
-              <div className="rounded-3xl border border-rose-800 bg-rose-950/20 p-4"><div className="text-sm font-semibold text-rose-200">Self-destruct</div><div className="mt-1 text-xs text-slate-300">Immediate clean fail state.</div><div className="mt-3"><ActionButton tone="rose" onClick={() => setRun((prev) => ({ ...prev, screen: 'gameover' }))}>Confirm self-destruct</ActionButton></div></div>
             </div>
           </div>
         </div>
