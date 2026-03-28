@@ -21,10 +21,10 @@ Then open the local URL shown in the terminal.
 Example:
 
 ```text
-http://localhost:5173/
+http://localhost:5174/
 ```
 
-If port `5173` is already in use, Vite will automatically choose another port such as `5174`. Use the exact URL printed by Vite.
+This project is pinned to port `5174`. If that port is already in use, Vite will stop with an error instead of switching ports.
 
 ## Stop the game
 
