@@ -5307,7 +5307,7 @@ function MiniActionButton({ children, onClick, disabled = false, active = false 
 }
 
 function TerminalTab({ active, onClick, children }) {
-  return <button className={`flex-1 rounded-xl px-2 py-2 text-xs font-semibold ${active ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`} onClick={onClick}>{children}</button>
+  return <button className={`flex-1 rounded-xl px-1 py-2 text-[11px] font-semibold sm:px-2 sm:text-xs ${active ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`} onClick={onClick}>{children}</button>
 }
 
 function NodeGlyph({ kind, size = 28 }) {
@@ -6574,7 +6574,7 @@ export default function STLSynthesisedGame() {
       <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
         <RunMenu run={run} setRun={setRun} />
         <div className="mx-auto w-full max-w-6xl">
-          <div className="grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_360px]">
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1.2fr)_360px]">
             <div className="rounded-3xl border border-amber-700 bg-slate-900 p-4 shadow-2xl">
               <div className="flex items-start justify-between gap-4">
                 <div>
@@ -6595,7 +6595,7 @@ export default function STLSynthesisedGame() {
                 <EntityStatusPanel title={warningEnemy.name} entity={warningEnemy} systems={{ shieldLayersDisabled: 0, engineDamage: 0 }} accent="rose" stats={[{ label: 'Speed', value: warningEnemy.speed, tone: 'rose' }, { label: 'Dodge', value: `${Math.round(dodgeChance(warningEnemy.maneuverability) * 100)}%`, tone: 'rose' }, { label: 'Stealth', value: warningEnemy.stealth, tone: 'amber' }, { label: 'Weapons', value: warningEnemy.weapons.length, tone: 'amber' }]} />
               </div>
             </div>
-            <div className="grid content-start gap-3">
+            <div className="grid grid-cols-1 content-start gap-3">
               <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-4">
                 <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Loadouts</div>
                 <div className="mt-3 grid gap-3">
@@ -6882,7 +6882,7 @@ export default function STLSynthesisedGame() {
           </div>
 
           <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
-            <div className="grid content-start gap-3">
+            <div className="grid grid-cols-1 content-start gap-3">
               {negotiation ? (
                 <div className="rounded-3xl border border-amber-800 bg-amber-950/20 p-3">
                   <div className="text-xs uppercase tracking-[0.2em] text-amber-300">Combat negotiation</div>
@@ -6920,7 +6920,7 @@ export default function STLSynthesisedGame() {
       <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
         <RunMenu run={run} setRun={setRun} />
         <div className="mx-auto w-full max-w-6xl">
-          <div className="grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_360px]">
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1.25fr)_360px]">
             <div className="rounded-3xl border border-amber-700 bg-slate-900 p-4 shadow-2xl">
               <div className="flex items-center justify-between gap-3">
                 <div>
@@ -7001,7 +7001,7 @@ export default function STLSynthesisedGame() {
               </div>
             </div>
 
-            <div className="grid content-start gap-3">
+            <div className="grid grid-cols-1 content-start gap-3">
               <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-4">
                 <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Combat log</div>
                 <div className="mt-3 grid max-h-[360px] gap-2 overflow-auto pr-1 text-sm text-slate-300">
@@ -7090,7 +7090,7 @@ export default function STLSynthesisedGame() {
       <RunMenu run={run} setRun={setRun} />
       <div className="mx-auto w-full max-w-7xl">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 shadow-2xl overflow-hidden">
-          <div className="grid gap-3 p-3 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
+          <div className="grid grid-cols-1 gap-3 p-3 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
             <div className="rounded-3xl border-2 border-cyan-700 bg-slate-950/70 overflow-hidden shadow-lg">
               <div className="border-b border-cyan-800/70 px-4 py-3"><div className="flex items-center justify-between gap-3"><div className="text-xs uppercase tracking-[0.24em] text-cyan-300">primary terminal</div><div className="text-[10px] uppercase tracking-[0.2em] text-slate-500">turn {run.turn} · system {run.systemIndex}</div></div></div>
               <ShipStatusStrip player={run.player} fuel={run.resources.fuel} fuelCapacity={run.player.fuelCapacity} shipName={run.shipName} playerName={run.playerName} resources={run.resources} />
@@ -7210,9 +7210,9 @@ export default function STLSynthesisedGame() {
               </div>
             </div>
 
-            <div className="grid content-start gap-3">
+            <div className="grid grid-cols-1 content-start gap-3">
               <div className="rounded-3xl border-2 border-emerald-700 bg-emerald-950/10 p-4 shadow-lg">
-              <div className="flex items-center justify-between gap-3 border-b border-emerald-800/50 pb-3">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-emerald-800/50 pb-3">
                 <div className="text-xs uppercase tracking-[0.24em] text-emerald-300">secondary terminal</div>
                 <div className="flex flex-1 gap-2">
                   <button className={`flex-1 rounded-xl px-3 py-2 text-sm font-semibold ${run.ui.legendOpen ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`} onClick={() => setRun((prev) => toggleLegend(prev))}>Legend</button>
