@@ -1,0 +1,31 @@
+name: Notify website
+
+# eelkedevries.com builds this game from main and serves it at /STL/, but its
+# deploy only runs when that repository changes. This sends it a signal to
+# rebuild, so the hosted game does not stay on the previous version.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "stl_outline.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request a site rebuild
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning title=site::SITE_DISPATCH_TOKEN is not set; eelkedevries.com was not asked to rebuild."
+            exit 0
+          fi
+          gh api repos/eelkedevries/eelkedevries.com/dispatches -f event_type=stl-updated
+          echo "Requested an eelkedevries.com rebuild."
