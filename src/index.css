@@ -1,5 +1,24 @@
 @import "tailwindcss";
 
+@theme {
+  --color-space: #060a12;
+  --color-panel: #0e1726;
+  --color-raised: #16233a;
+  --color-line: rgba(140, 190, 255, 0.18);
+  --color-ink: #eaf2ff;
+  --color-soft: #a3b3cb;
+  --color-mute: #8e9fb8;
+  --color-accent: #46e0ff;
+  --color-accent-ink: #03141b;
+  --color-fuel: #ffb443;
+  --color-hostile: #ff6170;
+  --color-hostile-soft: #ff8a95;
+  --color-exit: #7cf5c8;
+  --font-display: "Chakra Petch", ui-sans-serif, sans-serif;
+  --font-body: "Barlow", ui-sans-serif, sans-serif;
+  --font-num: "Barlow Condensed", ui-sans-serif, sans-serif;
+}
+
 html,
 body,
 #root {
@@ -8,5 +27,26 @@ body,
 
 body {
   margin: 0;
-  background: #020617;
+  background: var(--color-space);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+button {
+  font-family: inherit;
+}
+
+@keyframes stl-sheet-in {
+  from { transform: translateY(24px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.stl-sheet-in {
+  animation: stl-sheet-in 180ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stl-sheet-in { animation: none; }
 }
