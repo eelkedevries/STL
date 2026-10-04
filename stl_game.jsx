@@ -1657,6 +1657,7 @@ function buildNextPreview(seed, systemNumber) {
       'Automated watchers track ship signatures across the lanes.',
     ]),
   }
+  return system
 }
 
 function buildWaypoint(orbit, slot) {
@@ -4431,6 +4432,10 @@ function normalizeRun(candidate) {
   next.system.securityAlert = Math.max(0, Number(next.system.securityAlert) || 0)
   next.system.crimeCount = Math.max(0, Number(next.system.crimeCount) || 0)
   next.system.candidatePreviews = Array.isArray(next.system.candidatePreviews) ? next.system.candidatePreviews : []
+  // Saves made before the preview builder returned its result hold empty slots; rebuild them from the system seed.
+  if ((next.systemIndex || 1) < MASTER.maxSystems && next.system.seed && (next.system.candidatePreviews.length < 4 || next.system.candidatePreviews.some((preview) => !preview))) {
+    next.system.candidatePreviews = [1, 2, 3, 4].map((index) => buildNextPreview(`${next.system.seed}_candidate_${next.systemIndex || 1}_${index}`, (next.systemIndex || 1) + 1))
+  }
   const existingDirections = Array.isArray(next.system.orbitDirections) ? next.system.orbitDirections : []
   const inferredDominantDirection = next.system.dominantDirection === -1 || next.system.dominantDirection === 1
     ? next.system.dominantDirection
