@@ -2,6 +2,13 @@
 
 Small local React/Vite wrapper for the STL prototype game in [`stl_game.jsx`](./stl_game.jsx).
 
+## How to play
+
+- **Ship**: your home screen. Hull, shields and fuel sit at the top; tap a system or the crew, loadout and log buttons for details.
+- **Jump**: the orbital map. Pick a lit waypoint and jump; every ring turns after each jump or wait, and the dashed circle shows where your target will be next turn.
+- **Here**: services, trade, mining and other actions at your current waypoint. Leave a system from a Cardinal exit station.
+- **Combat** is planned, then executed. Tap your ship or drones, tap a circle or hex to set the move, choose a weapon and tap the enemy to aim at it and at one of its systems (hull, weapons, shields, engines or crew). *Execute* resolves both fleets' moves and fire at the same time.
+
 ## Requirements
 
 - Node.js

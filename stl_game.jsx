@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { Card, Icon, IconButton, Label, Meter, PrimaryButton, SecondaryButton, Sheet, ShipSilhouette, Tile } from './src/ui.jsx'
 
 const MASTER = {
   orbitCount: 5,
@@ -1937,7 +1938,7 @@ function buildTravelEvent(run, travelMode, currentNodeId, targetNodeId) {
       description: 'A single escape pod is tumbling through the lane with a weak beacon still active.',
       choices: [
         { id: 'rescue', label: 'Rescue pod', note: 'Possible survivor or useful equipment.' },
-        ...(playerStealthValue(run) >= 4 ? [{ id: 'shadow_scan', label: 'Shadow scan', note: 'Use a low-signature pass to inspect and recover quietly.' }] : []),
+        ...(playerStealthValue(run) >= 4 ? [{ id: 'shadow_scan', label: 'Shadow scan', note: 'Use a low-signature pass to inspect and recover quietly.', requirement: 'Stealth 4' }] : []),
         { id: 'strip', label: 'Strip it', note: 'Take the pod apart for raw materials.' },
         { id: 'leave', label: 'Leave it', note: 'Avoid the delay and preserve your approach vector.' },
       ],
@@ -1970,7 +1971,7 @@ function buildTravelEvent(run, travelMode, currentNodeId, targetNodeId) {
     description: 'A broken salvage tug drifts across the route with one accessible equipment crate still latched to its frame.',
     choices: [
       { id: 'dock', label: 'Dock and recover', note: `Try to recover the stored ${EQUIPMENT_CATALOG[salvageItemId].name}.` },
-      ...(playerStealthValue(run) >= 4 ? [{ id: 'silent_recover', label: 'Silent recover', note: 'Drift in under low signature and avoid drawing attention.' }] : []),
+      ...(playerStealthValue(run) >= 4 ? [{ id: 'silent_recover', label: 'Silent recover', note: 'Drift in under low signature and avoid drawing attention.', requirement: 'Stealth 4' }] : []),
       { id: 'bypass', label: 'Bypass it', note: 'Keep moving and avoid being pinned to the hulk.' },
     ],
     salvageItemId,
@@ -3303,6 +3304,8 @@ function startHexCombat(run, kind, openingFeed = [], enemyOverride = null, sourc
     negotiation: null,
     autoCombat: false,
   }
+  ensureFleetState(next.combat)
+  next.ui.selectedCombatWeaponIndex = next.player.weaponSlots.findIndex(Boolean)
   return appendLog(next, `Combat engaged with ${enemy.name}.`)
 }
 
@@ -3771,6 +3774,463 @@ function autoResolveHexCombat(run) {
       }
     : completed.ui.eventOutcome
   return appendLog(completed, `Auto-resolve completed in ${resolvedTurns} turn(s).`)
+}
+
+// Fleet combat: both sides plan, then every order resolves in one round
+// (movement first, then all fire at once), in the manner of simultaneous-turn
+// fleet games. Ship weapons aim at a unit and, for ships, at one of its systems.
+
+const FLEET_SYSTEM_IDS = ['hull', 'weapons', 'shields', 'engines', 'crew']
+const FLEET_SYSTEM_LABELS = { hull: 'Hull', weapons: 'Weapons', shields: 'Shields', engines: 'Engines', crew: 'Crew' }
+const FLEET_MOVE_PLAYBACK_MS = 700
+const FLEET_ROUND_PLAYBACK_MS = 1700
+
+function ensureFleetState(combat) {
+  if (!combat) return combat
+  const systems = (value) => ({
+    shieldLayersDisabled: Math.max(0, Number(value?.shieldLayersDisabled) || 0),
+    engineDamage: Math.max(0, Number(value?.engineDamage) || 0),
+  })
+  combat.orders = combat.orders && typeof combat.orders === 'object' ? combat.orders : {}
+  combat.playerSystems = systems(combat.playerSystems)
+  combat.enemySystems = systems(combat.enemySystems)
+  combat.lastRound = combat.lastRound && typeof combat.lastRound === 'object' ? combat.lastRound : null
+  combat.exitCheckedTurn = Math.max(0, Number(combat.exitCheckedTurn) || 0)
+  return combat
+}
+
+function fleetCombatActive(run) {
+  return Boolean(run?.combat && run.screen === 'combat_hex' && !run.combat.outcome && !run.combat.negotiation)
+}
+
+function fleetShipMoveOptions(run) {
+  if (!run?.combat?.playerShipUnit) return []
+  return hexCombatShipMoveTargets(run.combat, 'player', run.combat.playerShipUnit.actionsRemaining)
+}
+
+function fleetSquadronMoveHexes(run, squadronId) {
+  const entry = findCombatUnit(run, squadronId)
+  if (!entry || entry.kind !== 'squadron' || entry.side !== 'player') return []
+  const range = entry.unit.actionsRemaining || 0
+  if (range <= 0) return []
+  const occupied = combatOccupiedHexes(run.combat, entry.unit.id)
+  return Array.from({ length: HEX_ARENA.cols * HEX_ARENA.rows }, (_, index) => ({ col: index % HEX_ARENA.cols, row: Math.floor(index / HEX_ARENA.cols) }))
+    .filter((hex) => !hexEquals(hex, entry.unit.position) && hexDistance(entry.unit.position, hex) <= range && !occupied.some((entry2) => hexEquals(entry2, hex)))
+}
+
+function selectFleetUnit(run, unitId) {
+  const entry = findCombatUnit(run, unitId)
+  if (!entry || entry.side !== 'player') return run
+  const next = deepClone(run)
+  next.combat.selectedUnitId = unitId
+  if (entry.kind !== 'ship') next.ui.selectedCombatWeaponIndex = null
+  else if (!Number.isInteger(next.ui.selectedCombatWeaponIndex)) next.ui.selectedCombatWeaponIndex = next.player.weaponSlots.findIndex(Boolean)
+  return next
+}
+
+function selectFleetWeapon(run, weaponIndex) {
+  if (!run?.combat || !run.player.weaponSlots?.[weaponIndex]) return run
+  const next = deepClone(run)
+  next.combat.selectedUnitId = next.combat.playerShipUnit.id
+  next.ui.selectedCombatWeaponIndex = weaponIndex
+  next.ui.selectedCombatWeaponSide = 'player'
+  return next
+}
+
+function planFleetShipMove(run, option) {
+  if (!fleetCombatActive(run) || !option) return run
+  const next = deepClone(run)
+  ensureFleetState(next.combat)
+  const shipId = next.combat.playerShipUnit.id
+  const valid = fleetShipMoveOptions(next).find((entry) => entry.col === option.col && entry.row === option.row)
+  if (!valid) return run
+  next.combat.orders[shipId] = { ...(next.combat.orders[shipId] || {}), move: { col: valid.col, row: valid.row, distance: valid.distance } }
+  next.combat.selectedUnitId = shipId
+  return next
+}
+
+function planFleetSquadronMove(run, squadronId, hex) {
+  if (!fleetCombatActive(run)) return run
+  if (!fleetSquadronMoveHexes(run, squadronId).some((entry) => hexEquals(entry, hex))) return run
+  const next = deepClone(run)
+  ensureFleetState(next.combat)
+  const entry = findCombatUnit(next, squadronId)
+  next.combat.orders[squadronId] = { ...(next.combat.orders[squadronId] || {}), move: { col: hex.col, row: hex.row, distance: hexDistance(entry.unit.position, hex) } }
+  next.combat.selectedUnitId = squadronId
+  return next
+}
+
+function clearFleetMove(run, unitId) {
+  if (!run?.combat?.orders?.[unitId]?.move) return run
+  const next = deepClone(run)
+  next.combat.orders[unitId] = { ...next.combat.orders[unitId], move: null }
+  return next
+}
+
+function aimFleetWeapon(run, weaponIndex, targetUnitId, systemId = null) {
+  if (!fleetCombatActive(run)) return run
+  const target = findCombatUnit(run, targetUnitId)
+  if (!target || target.side !== 'enemy' || !run.player.weaponSlots?.[weaponIndex]) return run
+  const next = deepClone(run)
+  const weapon = next.player.weaponSlots[weaponIndex]
+  weapon.hexTargetUnitId = targetUnitId
+  if (target.kind === 'ship') weapon.targetId = FLEET_SYSTEM_IDS.includes(systemId) ? systemId : (FLEET_SYSTEM_IDS.includes(weapon.targetId) ? weapon.targetId : 'hull')
+  next.combat.selectedTargetUnitId = targetUnitId
+  return next
+}
+
+function aimFleetSquadron(run, squadronId, targetUnitId) {
+  if (!fleetCombatActive(run)) return run
+  const target = findCombatUnit(run, targetUnitId)
+  if (!target || target.side !== 'enemy') return run
+  const next = deepClone(run)
+  ensureFleetState(next.combat)
+  next.combat.orders[squadronId] = { ...(next.combat.orders[squadronId] || {}), targetId: targetUnitId }
+  return next
+}
+
+function fleetWeaponTarget(run, weapon) {
+  return weaponFocusedUnitId(run, weapon, 'player') || defaultHexTargetId(run, 'player')
+}
+
+function fleetSquadronTarget(run, squadron) {
+  const planned = run.combat?.orders?.[squadron.id]?.targetId
+  if (planned && isCombatUnitAlive(run, planned) && findCombatUnit(run, planned)?.side !== squadron.side) return planned
+  return autoCombatSquadronTargetId(run, squadron.side)
+}
+
+function squadronStepToward(combat, squadron, targetHex, steps) {
+  let position = { ...squadron.position }
+  let moved = 0
+  for (let index = 0; index < steps; index += 1) {
+    if (hexDistance(position, targetHex) <= 1) break
+    const occupied = combatOccupiedHexes({ ...combat, squadrons: (combat.squadrons || []).map((entry) => entry.id === squadron.id ? { ...entry, position } : entry) }, squadron.id)
+    const step = nearestHexTowardTarget(position, targetHex, occupied)
+    if (!step) break
+    position = { col: step.col, row: step.row }
+    moved += 1
+  }
+  return { position, moved }
+}
+
+function rollFleetShipShot(next, side, weaponIndex, targetId, systemId, rng) {
+  const isPlayerSide = side === 'player'
+  const weapons = shipWeaponsForSide(next, side)
+  const weapon = weapons?.[weaponIndex]
+  if (!weaponCanFireInHexCombat(next, weapon, isPlayerSide)) return null
+  const target = findCombatUnit(next, targetId)
+  if (!target || target.side === side) return null
+  if (!consumeHexCombatWeaponAmmo(next, weapon, isPlayerSide)) return null
+  const multiplier = isPlayerSide ? weaponDamageMultiplier(next, true) : 1
+  const damage = Math.max(1, Math.round((weapon.damage || 1) * multiplier * (weapon.id === 'Missile_I' ? missileDamageBonus(weapon.loadedAmmoLevel || weapon.level || 1) : 1)))
+  const hit = rng.chance(weapon.accuracy || 1)
+  weapon.hexReadyIn = weapon.hexCooldownTurns || hexCombatWeaponCooldownTurns(weapon)
+  appendHexCombatEffect(next, {
+    fromUnitId: isPlayerSide ? next.combat.playerShipUnit?.id : next.combat.enemyShipUnit?.id,
+    toUnitId: targetId,
+    kind: weapon.id === 'Missile_I' ? 'missile' : weapon.id === 'Kinetic_I' ? 'kinetic' : weapon.id === 'Mining_Laser' ? 'mining' : 'laser',
+    colour: isPlayerSide ? '#46E0FF' : '#FF6170',
+    hit,
+  })
+  if (isPlayerSide) awardCrewXp(next, 1, (member) => crewSkillLevel(member, 'weapon_specialist') > 0)
+  return { side, weaponName: weapon.name, weaponId: weapon.id, shieldPen: weapon.shieldPen || 0.05, targetId, systemId: target.kind === 'ship' ? systemId : 'hull', damage, hit }
+}
+
+function applyFleetSystemHit(next, targetSide, systemId, damage) {
+  if (targetSide === 'enemy') {
+    const result = applyTargetedImpact({
+      entity: next.combat.enemy,
+      systems: next.combat.enemySystems,
+      weapons: next.combat.enemy.weapons,
+      crew: next.combat.enemy.crew || [],
+      targetSystem: systemId,
+      damage,
+      shieldPen: 0,
+      run: next,
+      isTargetPlayerSide: false,
+    })
+    next.combat.enemy = { ...next.combat.enemy, ...result.entity, weapons: result.weapons, crew: result.crew }
+    next.combat.enemySystems = result.systems
+    return result.detail
+  }
+  const result = applyTargetedImpact({
+    entity: next.player,
+    systems: next.combat.playerSystems,
+    weapons: next.player.weaponSlots,
+    crew: next.crew,
+    targetSystem: systemId,
+    damage,
+    shieldPen: 0,
+    run: next,
+    isTargetPlayerSide: true,
+  })
+  next.player = { ...next.player, ...result.entity, weaponSlots: result.weapons }
+  next.crew = result.crew
+  next.combat.playerSystems = result.systems
+  return result.detail
+}
+
+function applyFleetShipShot(next, shot, summary) {
+  const sourceName = shot.side === 'player' ? next.shipName : next.combat.enemy.name
+  const target = findCombatUnit(next, shot.targetId)
+  const targetName = target?.kind === 'ship' ? (target.side === 'player' ? next.shipName : next.combat.enemy.name) : (target?.side === 'player' ? 'your drones' : 'their drones')
+  if (!shot.hit) {
+    appendHexCombatFloaters(next, shot.targetId, [{ text: 'MISS', colour: '#cbd5e1' }])
+    summary.push({ tone: 'mute', text: `${sourceName}'s ${shot.weaponName.replace(/ Mk \d+$/, '')} missed` })
+    return
+  }
+  if (!target) return
+  const hullBefore = target.kind === 'ship' ? (target.side === 'player' ? next.player.hull : next.combat.enemy.hull) : 0
+  const result = resolveHexDamageToUnit(next, shot.targetId, shot.damage, shot.shieldPen, shot.side === 'player' ? 'Player' : 'Enemy')
+  const hullAfter = target.kind === 'ship' ? (target.side === 'player' ? next.player.hull : next.combat.enemy.hull) : 0
+  let systemDetail = null
+  if (target.kind === 'ship' && shot.systemId !== 'hull' && hullBefore - hullAfter > 0 && hullAfter > 0) {
+    systemDetail = applyFleetSystemHit(next, target.side, shot.systemId, shot.damage)
+    appendHexCombatFloaters(next, shot.targetId, [{ text: `${FLEET_SYSTEM_LABELS[shot.systemId].toUpperCase()} HIT`, colour: '#FFB443' }])
+  }
+  const tone = shot.side === 'player' ? 'good' : 'bad'
+  const systemText = systemDetail ? ` · ${FLEET_SYSTEM_LABELS[shot.systemId].toLowerCase()} damaged` : target.kind === 'ship' && hullBefore === hullAfter ? ' · absorbed by shields' : ''
+  summary.push({ tone, text: `${sourceName} hit ${targetName} for ${shot.damage}${systemText}` })
+  return result
+}
+
+function planFleetSquadronStrike(next, squadron) {
+  if (!squadron || squadron.attackAvailable === false || squadronAliveCount(squadron) <= 0) return null
+  const targetId = fleetSquadronTarget(next, squadron)
+  const target = findCombatUnit(next, targetId)
+  if (!target || target.side === squadron.side) return null
+  const inRange = target.kind === 'ship' ? squadronAdjacentToShip(squadron, target.unit) : hexDistance(squadron.position, target.unit.position) <= 1
+  if (!inRange) return null
+  return { squadronId: squadron.id, side: squadron.side, targetId, damage: squadronAliveCount(squadron) }
+}
+
+function applyFleetSquadronStrike(next, strike, summary) {
+  const squadron = (next.combat.squadrons || []).find((entry) => entry.id === strike.squadronId)
+  if (squadron) squadron.attackAvailable = false
+  if (!isCombatUnitAlive(next, strike.targetId)) return
+  const target = findCombatUnit(next, strike.targetId)
+  const aliveBefore = target?.kind === 'squadron' ? squadronAliveCount(target.unit) : 0
+  appendHexCombatEffect(next, { fromUnitId: strike.squadronId, toUnitId: strike.targetId, kind: 'drone_laser', colour: strike.side === 'player' ? '#46E0FF' : '#FF6170', hit: true })
+  resolveHexDamageToUnit(next, strike.targetId, strike.damage, 0.05, strike.side === 'player' ? 'Player' : 'Enemy')
+  if (strike.side === 'player') awardCrewXp(next, 1, (member) => crewSkillLevel(member, 'weapon_specialist') > 0)
+  const owner = strike.side === 'player' ? 'Your drones' : 'Enemy drones'
+  if (target?.kind === 'squadron') {
+    const after = findCombatUnit(next, strike.targetId)
+    const lost = aliveBefore - (after ? squadronAliveCount(after.unit) : 0)
+    summary.push({ tone: strike.side === 'player' ? 'good' : 'bad', text: lost > 0 ? `${owner} destroyed ${lost} drone${lost === 1 ? '' : 's'}` : `${owner} struck enemy drones` })
+  } else {
+    summary.push({ tone: strike.side === 'player' ? 'good' : 'bad', text: `${owner} hit ${strike.side === 'player' ? next.combat.enemy.name : next.shipName} for ${strike.damage}` })
+  }
+}
+
+function repairFleetSystems(next, side, summary) {
+  const key = side === 'player' ? 'playerSystems' : 'enemySystems'
+  const systems = next.combat[key]
+  const canRepair = side === 'player'
+    ? playerRepairCapacity(next) > 0
+    : (next.combat.enemy.crew || []).some((member) => member.role === 'repair_specialist' && (member.health ?? 1) > 0)
+  if (!canRepair) return
+  if (systems.shieldLayersDisabled > 0) {
+    systems.shieldLayersDisabled -= 1
+    if (side === 'player') summary.push({ tone: 'good', text: 'Crew brought a shield layer back online' })
+  } else if (systems.engineDamage > 0) {
+    const amount = side === 'player' ? Math.max(2, Math.round(playerRepairRate(next) * 2)) : 2
+    systems.engineDamage = Math.max(0, systems.engineDamage - amount)
+    if (side === 'player') summary.push({ tone: 'good', text: 'Crew patched the engines' })
+  }
+}
+
+function enemyCrewDisabled(next) {
+  const crew = next.combat?.enemy?.crew || []
+  return crew.length > 0 && crew.every((member) => (member.health ?? 1) <= 0)
+}
+
+function resolveFleetRound(run) {
+  if (!run?.combat || run.screen !== 'combat_hex' || run.combat.outcome) return run
+  if (run.combat.negotiation) return appendLog(run, 'Answer the offer on the table before executing.')
+  const next = deepClone(run)
+  const combat = ensureFleetState(next.combat)
+  const roundNumber = combat.turnNumber
+  const roundStart = Date.now()
+  const messages = []
+  const summary = []
+  const rng = makeRng(`${next.seed}_fleet_${next.turn}_${roundNumber}_${next.player.hull}_${combat.enemy.hull}`)
+
+  if (combat.exitCheckedTurn !== roundNumber) {
+    combat.exitCheckedTurn = roundNumber
+    if (enemyHexCombatAttemptExit(next, messages, rng)) {
+      setHexCombatFeed(next, messages)
+      return next
+    }
+  }
+
+  const unitPositions = () => Object.fromEntries([
+    [combat.playerShipUnit.id, { kind: 'ship', side: 'player', col: combat.playerShipUnit.col, row: combat.playerShipUnit.row }],
+    [combat.enemyShipUnit.id, { kind: 'ship', side: 'enemy', col: combat.enemyShipUnit.col, row: combat.enemyShipUnit.row }],
+    ...(combat.squadrons || []).map((squadron) => [squadron.id, { kind: 'squadron', side: squadron.side, col: squadron.position.col, row: squadron.position.row }]),
+  ])
+  const before = unitPositions()
+
+  // Movement. Enemy intentions are chosen from the positions both fleets started the round in.
+  const enemyShipPlan = chooseHexCombatShipMoveTarget(next, 'enemy', 'aggressive')
+  const shipOrder = combat.orders[combat.playerShipUnit.id]?.move
+  if (shipOrder) {
+    const valid = hexCombatShipMoveTargets(combat, 'player', combat.playerShipUnit.actionsRemaining).find((entry) => entry.col === shipOrder.col && entry.row === shipOrder.row)
+    if (valid) {
+      combat.playerShipUnit = buildHexShipUnit('player', { ...combat.playerShipUnit, col: valid.col, row: valid.row, actionsRemaining: Math.max(0, (combat.playerShipUnit.actionsRemaining || 0) - valid.distance), movedThisTurn: true })
+      messages.push(`Player: ${next.shipName} moved ${valid.distance} hex${valid.distance === 1 ? '' : 'es'}.`)
+    } else {
+      summary.push({ tone: 'mute', text: `${next.shipName} could not reach the planned position` })
+    }
+  }
+  activeSquadrons(combat, 'player').forEach((squadron) => {
+    const move = combat.orders[squadron.id]?.move
+    if (!move) return
+    const blocked = combatOccupiedHexes(combat, squadron.id).some((entry) => hexEquals(entry, move))
+    const cost = hexDistance(squadron.position, move)
+    if (blocked || cost > (squadron.actionsRemaining || 0)) {
+      summary.push({ tone: 'mute', text: 'Your drones could not reach their planned hex' })
+      return
+    }
+    squadron.position = { col: move.col, row: move.row }
+    squadron.actionsRemaining = Math.max(0, (squadron.actionsRemaining || 0) - cost)
+    squadron.movedThisTurn = true
+  })
+  if (activeSquadrons(combat, 'enemy').length === 0 && (combat.enemyDroneBayCooldown || 0) <= 0 && rng.chance(0.62)) {
+    const deployed = deployHexCombatSquadron(next, 'enemy')
+    if (deployed.deployed) {
+      messages.push(deployed.message)
+      summary.push({ tone: 'bad', text: `${combat.enemy.name} launched a drone squadron` })
+    }
+  }
+  activeSquadrons(combat, 'enemy').forEach((squadron) => {
+    if (squadron.launchedTurn === roundNumber) return
+    const targetId = fleetSquadronTarget(next, squadron)
+    const target = findCombatUnit(next, targetId)
+    if (!target) return
+    const targetHex = target.kind === 'ship' ? hexCombatShipCenter(target.unit) : target.unit.position
+    const inRange = target.kind === 'ship' ? squadronAdjacentToShip(squadron, target.unit) : hexDistance(squadron.position, target.unit.position) <= 1
+    if (inRange) return
+    const step = squadronStepToward(combat, squadron, targetHex, squadron.actionsRemaining || 0)
+    squadron.position = step.position
+    squadron.actionsRemaining = Math.max(0, (squadron.actionsRemaining || 0) - step.moved)
+    squadron.movedThisTurn = step.moved > 0
+  })
+  if (enemyShipPlan) {
+    const valid = hexCombatShipMoveTargets(combat, 'enemy', combat.enemyShipUnit.actionsRemaining).find((entry) => entry.col === enemyShipPlan.col && entry.row === enemyShipPlan.row)
+    if (valid) combat.enemyShipUnit = buildHexShipUnit('enemy', { ...combat.enemyShipUnit, col: valid.col, row: valid.row, actionsRemaining: Math.max(0, (combat.enemyShipUnit.actionsRemaining || 0) - valid.distance), movedThisTurn: true })
+  }
+  const after = unitPositions()
+
+  // Fire. Every shot is rolled from the post-movement state before any damage lands.
+  const strikes = [...activeSquadrons(combat, 'player'), ...activeSquadrons(combat, 'enemy')].map((squadron) => planFleetSquadronStrike(next, squadron)).filter(Boolean)
+  const shots = []
+  next.player.weaponSlots.forEach((weapon, index) => {
+    if (!weapon) return
+    const targetId = fleetWeaponTarget(next, weapon)
+    const shot = targetId ? rollFleetShipShot(next, 'player', index, targetId, FLEET_SYSTEM_IDS.includes(weapon.targetId) ? weapon.targetId : 'hull', rng) : null
+    if (shot) shots.push(shot)
+  })
+  if (combat.enemy.hull > 0 && !enemyCrewDisabled(next)) {
+    readyHexShipWeaponIndices(next, 'enemy').forEach((index) => {
+      const targetId = autoCombatShipTargetId(next, 'enemy')
+      const shot = targetId ? rollFleetShipShot(next, 'enemy', index, targetId, chooseEnemyTargetSystem(rng), rng) : null
+      if (shot) shots.push(shot)
+    })
+  }
+  strikes.forEach((strike) => applyFleetSquadronStrike(next, strike, summary))
+  shots.forEach((shot) => applyFleetShipShot(next, shot, summary))
+  if (shots.length === 0 && strikes.length === 0) summary.push({ tone: 'mute', text: 'No one was in a position to fire' })
+
+  repairFleetSystems(next, 'player', summary)
+  repairFleetSystems(next, 'enemy', summary)
+  processCombatReloads(next, messages)
+  processCombatRepairs(next, 3, messages)
+
+  // Round bookkeeping, as at the end of a tactical turn.
+  const playerMoves = Math.max(1, hexCombatShipMovePoints(playerSpeedValue(next)) - combatEnginePenalty(combat.playerSystems))
+  const enemyMoves = Math.max(1, hexCombatShipMovePoints(combat.enemy.speed) - combatEnginePenalty(combat.enemySystems))
+  next.player.weaponSlots = decrementHexWeaponCooldowns(next.player.weaponSlots)
+  combat.enemy.weapons = decrementHexWeaponCooldowns(combat.enemy.weapons)
+  combat.squadrons = (combat.squadrons || []).map((entry) => regenerateSquadronShield({ ...entry, actionsPerTurn: droneMoveRange(), movedThisTurn: false, actionsRemaining: droneMoveRange(), attackAvailable: true })).filter((entry) => squadronAliveCount(entry) > 0)
+  combat.playerShipUnit = buildHexShipUnit('player', { ...combat.playerShipUnit, actionsPerTurn: playerMoves, actionsRemaining: playerMoves, attackAvailable: true, movedThisTurn: false, firedThisTurn: false })
+  combat.enemyShipUnit = buildHexShipUnit('enemy', { ...combat.enemyShipUnit, actionsPerTurn: enemyMoves, actionsRemaining: enemyMoves, attackAvailable: true, movedThisTurn: false, firedThisTurn: false })
+  combat.droneBayCooldown = Math.max(0, (combat.droneBayCooldown || 0) - 1)
+  combat.enemyDroneBayCooldown = Math.max(0, (combat.enemyDroneBayCooldown || 0) - 1)
+  combat.orders = Object.fromEntries(Object.entries(combat.orders || {}).filter(([unitId]) => isCombatUnitAlive(next, unitId)).map(([unitId, order]) => [unitId, { ...order, move: null }]))
+  combat.turnNumber = roundNumber + 1
+  if (!isCombatUnitAlive(next, combat.selectedUnitId) || findCombatUnit(next, combat.selectedUnitId)?.side !== 'player') combat.selectedUnitId = combat.playerShipUnit.id
+
+  // Shots land after the fleets have finished moving on screen.
+  combat.effects = (combat.effects || []).map((effect) => (effect.startedAt >= roundStart ? { ...effect, startedAt: effect.startedAt + FLEET_MOVE_PLAYBACK_MS } : effect))
+  combat.floaters = (combat.floaters || []).map((entry) => (entry.startedAt >= roundStart ? { ...entry, startedAt: entry.startedAt + FLEET_MOVE_PLAYBACK_MS + 260 } : entry))
+  combat.lastRound = { number: roundNumber, at: roundStart, seen: false, before, after, summary: summary.slice(0, 5) }
+  setHexCombatFeed(next, [...messages, ...summary.map((entry) => entry.text + '.')])
+
+  if (next.player.hull <= 0) {
+    next.screen = 'gameover'
+    next.combat = null
+    return appendLog(next, 'The player ship was destroyed in tactical combat.')
+  }
+  if (combat.enemy.hull <= 0) return awardHexCombatVictory(next)
+  if (enemyCrewDisabled(next)) {
+    const won = awardHexCombatVictory(next)
+    won.combat.outcome.title = `${won.combat.enemy.name} crew disabled`
+    return won
+  }
+  return next
+}
+
+function acknowledgeFleetRound(run) {
+  if (!run?.combat?.lastRound) return run
+  const next = deepClone(run)
+  next.combat.lastRound.seen = true
+  return next
+}
+
+function autoPlanFleetOrders(next) {
+  const combat = ensureFleetState(next.combat)
+  const plan = chooseHexCombatShipMoveTarget(next, 'player', 'defensive')
+  combat.orders[combat.playerShipUnit.id] = { ...(combat.orders[combat.playerShipUnit.id] || {}), move: plan ? { col: plan.col, row: plan.row, distance: plan.distance } : null }
+  next.player.weaponSlots.forEach((weapon) => {
+    if (!weapon) return
+    const targetId = autoCombatShipTargetId(next, 'player')
+    weapon.hexTargetUnitId = targetId
+    if (findCombatUnit(next, targetId)?.kind === 'ship' && !FLEET_SYSTEM_IDS.includes(weapon.targetId)) weapon.targetId = 'hull'
+  })
+  if (activeSquadrons(combat, 'player').length === 0 && (combat.droneBayCooldown || 0) <= 0) deployHexCombatSquadron(next, 'player')
+  activeSquadrons(combat, 'player').forEach((squadron) => {
+    const targetId = autoCombatSquadronTargetId(next, 'player')
+    const target = findCombatUnit(next, targetId)
+    if (!target) return
+    const targetHex = target.kind === 'ship' ? hexCombatShipCenter(target.unit) : target.unit.position
+    const step = squadronStepToward(combat, squadron, targetHex, squadron.actionsRemaining || 0)
+    combat.orders[squadron.id] = { targetId, move: step.moved > 0 ? { ...step.position, distance: step.moved } : null }
+  })
+  return next
+}
+
+function autoResolveFleetCombat(run) {
+  if (!fleetCombatActive(run)) return run
+  let next = deepClone(run)
+  let rounds = 0
+  while (next?.combat && next.screen === 'combat_hex' && !next.combat.outcome && rounds < 30) {
+    if (next.combat.negotiation) {
+      if (next.combat.negotiation.side !== 'enemy') break
+      next = resolveHexCombatNegotiation(next, 'accept')
+      continue
+    }
+    next = resolveFleetRound(autoPlanFleetOrders(deepClone(next)))
+    rounds += 1
+  }
+  if (next?.screen === 'gameover' || !next?.combat?.outcome) {
+    if (next?.combat) next.combat.lastRound = null
+    return next
+  }
+  const outcomeTitle = next.combat.outcome.title
+  const completed = continueAfterCombat(next)
+  completed.ui.eventOutcome = completed.ui.eventOutcome ? { ...completed.ui.eventOutcome, title: 'Auto-resolve complete', text: `${outcomeTitle} after ${rounds} round${rounds === 1 ? '' : 's'}.` } : completed.ui.eventOutcome
+  return completed
 }
 
 function startCombat(run, kind, openingFeed = [], enemyOverride = null, sourceNpcId = null) {
@@ -4294,6 +4754,8 @@ function defaultUiState() {
     merchantContext: null,
     merchantTab: 'buy',
     eventOutcome: null,
+    view: 'ship',
+    sheet: null,
   }
 }
 
@@ -4332,6 +4794,8 @@ function normalizeRun(candidate) {
 
   next.ui = { ...defaultUiState(), ...(next.ui || {}) }
   next.ui.mainTerminal = ['system', 'local', 'ship', 'crew', 'log'].includes(next.ui.mainTerminal) ? next.ui.mainTerminal : 'system'
+  next.ui.view = next.ui.view === 'map' ? 'map' : 'ship'
+  next.ui.sheet = ['here', 'loadout', 'crew', 'log', 'legend', 'info', 'menu'].includes(next.ui.sheet) ? next.ui.sheet : null
   next.ui.menuOpen = Boolean(next.ui.menuOpen)
   next.ui.menuPanel = ['root', 'options', 'dev'].includes(next.ui.menuPanel) ? next.ui.menuPanel : 'root'
   next.ui.mapScale = clamp(Number(next.ui.mapScale) || 1, 1, 4)
@@ -4585,6 +5049,7 @@ function normalizeRun(candidate) {
     })).filter((squadron) => squadronAliveCount(squadron) > 0) : []
     if (next.combat.selectedUnitId && !isCombatUnitAlive(next, next.combat.selectedUnitId)) next.combat.selectedUnitId = next.combat.playerShipUnit.id
     if (!isCombatUnitAlive(next, next.combat.selectedTargetUnitId)) next.combat.selectedTargetUnitId = next.combat.enemyShipUnit.id
+    ensureFleetState(next.combat)
   } else {
     next.combat.speed = [0, 2, 4, 6].includes(next.combat.speed) ? next.combat.speed : 2
     next.combat.feed = Array.isArray(next.combat.feed) ? next.combat.feed.filter((entry) => typeof entry === 'string').slice(0, 18) : ['Combat resumed.']
@@ -6211,12 +6676,1152 @@ function RunMenu({ run, setRun }) {
   )
 }
 
+const TONE_HEX = { hostile: '#FF6170', fuel: '#FFB443', exit: '#7CF5C8', neutral: '#B7C3D6', accent: '#46E0FF', mute: '#7F90AA' }
+
+function nodeTone(kind) {
+  if (['pirate', 'patrol', 'hazard'].includes(kind)) return 'hostile'
+  if (['merchant', 'station', 'shipyard', 'depot', 'base_arrival'].includes(kind)) return 'fuel'
+  if (kind === 'base_departure') return 'exit'
+  if (kind === 'spent' || kind === 'empty') return 'mute'
+  return 'neutral'
+}
+
+const KIND_ICON = {
+  base_arrival: 'station', base_departure: 'exit', station: 'station', shipyard: 'repair', merchant: 'trade',
+  planet: 'probe', belt: 'mine', pirate: 'attack', patrol: 'attack', distress: 'hail', hazard: 'attack',
+  wreck: 'salvage', anomaly: 'probe', relay: 'relay', convoy: 'cargo', survey: 'probe', depot: 'cargo',
+  empty: 'info', spent: 'info',
+}
+
+const NPC_TONE = { pirate: 'hostile', patrol: 'hostile', merchant: 'fuel', civilian: 'neutral' }
+
+function nodeDisplayKind(node) {
+  return isNodeDepleted(node) && !node.kind.startsWith('base') ? 'spent' : node.kind
+}
+
+function nodeTitle(node) {
+  if (!node) return ''
+  if (node.kind === 'empty') return 'Empty space'
+  return node.label || KIND_META[node.kind]?.label || 'Waypoint'
+}
+
+function localActionLabel(node) {
+  if (!node) return null
+  if (['station', 'base_arrival', 'base_departure'].includes(node.kind)) return node.kind === 'base_departure' ? 'Depart' : 'Services'
+  return { merchant: 'Trade', belt: 'Mine', depot: 'Salvage', anomaly: 'Probe', relay: 'Relay', shipyard: 'Shipyard' }[node.kind] || null
+}
+
+function stationServiceTiles(run) {
+  const hullFull = run.player.hull >= run.player.hullMax
+  const shieldsFull = run.player.shields >= run.player.shieldsMax
+  return [
+    { id: 'repair', icon: 'repair', title: 'Repair +16', detail: '4 scrap · 2 parts', disabled: hullFull || run.resources.scrap < 4 || run.resources.parts < 2, note: hullFull ? 'Hull already full' : null, act: repairHull },
+    { id: 'refuel', icon: 'fuel', tone: 'fuel', title: 'Refuel +6', detail: '6 scrap', disabled: run.resources.scrap < 6, note: null, act: refuelShip },
+    { id: 'recruit', icon: 'recruit', title: 'Recruit', detail: '10 scrap', disabled: crewAtCapacity(run) || run.resources.scrap < 10, note: crewAtCapacity(run) ? 'Berths full' : null, act: recruitCrew },
+    { id: 'shields', icon: 'shield', title: 'Shields +10', detail: '1 part', disabled: shieldsFull || run.resources.parts < 1, note: shieldsFull ? 'Already full' : null, act: rechargeShields },
+  ]
+}
+
+function SystemMap({ run, animatedSystem, reachableIds, selectedNode, current, shipAnimationPos, ghostPos, viewBox, mapFrameRef, gestureRef, handlers, onSelectNode, onSelectNpc }) {
+  const system = animatedSystem || run.system
+  const meteorPath = run.system.meteorPath
+  const locked = Boolean(run.ui.travelAnimation)
+  const guard = (event, action) => {
+    event.stopPropagation()
+    if (locked) return
+    if (gestureRef.current.moved) {
+      gestureRef.current.moved = false
+      return
+    }
+    action()
+  }
+  return (
+    <div ref={mapFrameRef} className="relative w-full" style={{ touchAction: 'none' }} onTouchStart={handlers.touchStart} onTouchMove={handlers.touchMove} onTouchEnd={handlers.touchEnd} onTouchCancel={handlers.touchEnd} onMouseDown={handlers.mouseDown} onMouseMove={handlers.mouseMove} onMouseUp={handlers.mouseUp} onMouseLeave={handlers.mouseUp} onWheel={handlers.wheel}>
+      <svg viewBox={viewBox} className="block aspect-square w-full" role="img" aria-label={`Orbital map of ${run.system.name || 'the system'}`}>
+        <defs>
+          <radialGradient id="stlStar" cx="50%" cy="50%" r="50%"><stop offset="0%" stopColor="#FFF4D6" /><stop offset="45%" stopColor="#FFC861" /><stop offset="100%" stopColor="#FF9F2E" stopOpacity="0" /></radialGradient>
+        </defs>
+        <rect x="0" y="0" width="360" height="360" fill="#060A12" />
+        <circle cx="180" cy="180" r="28" fill="url(#stlStar)" opacity="0.5" />
+        <circle cx="180" cy="180" r="12" fill="url(#stlStar)" />
+        {meteorPath ? (() => { const { p1, p2 } = meteorLineEndpoints(meteorPath); return <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke="#FFB443" strokeOpacity="0.55" strokeWidth="2" strokeDasharray="7 6" /> })() : null}
+        {Array.from({ length: MASTER.orbitCount }, (_, orbit) => {
+          const band = ringBand(orbit)
+          const slotCount = MASTER.slotCounts[orbit]
+          const rotationDeg = orbitRotationDeg(system, orbit)
+          return (
+            <g key={`orbit_${orbit}`} transform={`rotate(${rotationDeg} 180 180)`}>
+              {Array.from({ length: slotCount }, (_, slot) => {
+                const segmentNode = findNodeByOrbitSlot(run.system, orbit, slot)
+                const reachable = segmentNode && reachableIds.has(segmentNode.id) && segmentNode.id !== current.id
+                const selected = selectedNode && selectedNode.orbit === orbit && selectedNode.slot === slot
+                const here = current.orbit === orbit && current.slot === slot
+                const fill = selected ? 'rgba(70,224,255,0.45)' : reachable ? 'rgba(70,224,255,0.2)' : here ? 'rgba(234,242,255,0.14)' : 'rgba(140,180,230,0.07)'
+                return (
+                  <path
+                    key={`seg_${orbit}_${slot}`}
+                    d={describeRingSegment(180, 180, band.inner, band.outer, boundaryAngleOfSlot(slot, slotCount), boundaryAngleOfSlot(slot + 1, slotCount))}
+                    fill={fill}
+                    stroke="#060A12"
+                    strokeWidth={orbit >= 4 ? 0.8 : 1.2}
+                    onClick={(event) => guard(event, () => segmentNode && onSelectNode(segmentNode.id))}
+                    style={{ cursor: locked ? 'default' : 'pointer' }}
+                  />
+                )
+              })}
+            </g>
+          )
+        })}
+        {run.system.nodes.map((node) => {
+          if (node.kind === 'empty') return null
+          const pos = nodePosition(system, node)
+          const kind = nodeDisplayKind(node)
+          const colour = TONE_HEX[nodeTone(kind)]
+          const selected = node.id === run.selectedNodeId
+          const label = node.kind.startsWith('base') ? (node.kind === 'base_arrival' ? 'A' : `D${node.departureIndex + 1}`) : KIND_META[kind]?.symbol
+          return (
+            <g key={node.id} onClick={(event) => guard(event, () => onSelectNode(node.id))} style={{ cursor: locked ? 'default' : 'pointer' }}>
+              <circle cx={pos.x} cy={pos.y} r="13" fill="transparent" />
+              {selected ? <circle cx={pos.x} cy={pos.y} r="11" fill="none" stroke="#46E0FF" strokeWidth="2" /> : null}
+              <circle cx={pos.x} cy={pos.y} r="7.5" fill="#0B1424" stroke={colour} strokeOpacity={kind === 'spent' ? 0.4 : 0.9} strokeWidth="1.3" />
+              <text x={pos.x} y={pos.y + 2.4} textAnchor="middle" fontSize={node.kind.startsWith('base') ? '6.5' : '8'} fontWeight="700" fill={colour} fillOpacity={kind === 'spent' ? 0.5 : 1} style={{ pointerEvents: 'none', userSelect: 'none' }}>{label}</text>
+            </g>
+          )
+        })}
+        {(run.system.npcs || []).map((npc) => {
+          const node = findNode(run.system, npc.currentNodeId)
+          if (!node) return null
+          const pos = nodePosition(system, node)
+          const colour = TONE_HEX[NPC_TONE[npc.kind] || 'neutral']
+          const selected = npc.id === run.ui.selectedNpcId
+          return (
+            <g key={npc.id} onClick={(event) => guard(event, () => onSelectNpc(npc.id))} style={{ cursor: locked ? 'default' : 'pointer' }}>
+              <circle cx={pos.x + 9} cy={pos.y - 9} r="12" fill="transparent" />
+              {selected ? <circle cx={pos.x + 9} cy={pos.y - 9} r="10" fill="none" stroke="#EAF2FF" strokeWidth="1.8" /> : null}
+              <polygon points={`${pos.x + 9},${pos.y - 16} ${pos.x + 15},${pos.y - 4} ${pos.x + 3},${pos.y - 4}`} fill={colour} />
+            </g>
+          )
+        })}
+        {ghostPos ? <circle cx={ghostPos.x} cy={ghostPos.y} r="7" fill="none" stroke="#46E0FF" strokeOpacity="0.7" strokeWidth="1.2" strokeDasharray="2 2" pointerEvents="none" /> : null}
+        <g pointerEvents="none" transform={`translate(${shipAnimationPos.x} ${shipAnimationPos.y})`}>
+          <circle r="11" fill="none" stroke="#EAF2FF" strokeOpacity="0.6" strokeWidth="1.4" />
+          <polygon points="0,-7 5.5,6 0,3 -5.5,6" fill="#EAF2FF" />
+        </g>
+      </svg>
+    </div>
+  )
+}
+
+function ShipTopDown({ run, onOpenLoadout, onOpenCrew }) {
+  const stations = { bridge: [], weapons: [], engines: [], quarters: [] }
+  ;(run.crew || []).forEach((member) => {
+    if (member.role === 'pilot' || member.role === 'diplomat') stations.bridge.push(member)
+    else if (member.role === 'hacker' || crewSkillLevel(member, 'weapon_specialist') > 0) stations.weapons.push(member)
+    else if (member.role === 'repair') stations.engines.push(member)
+    else stations.quarters.push(member)
+  })
+  const nodes = [
+    { id: 'bridge', icon: 'bridge', label: 'Bridge', status: `Dodge ${Math.round(dodgeChance(run.player.maneuverability + pilotManeuverBonus(run)) * 100)}%`, x: 130, y: 70, onClick: () => onOpenCrew(stations.bridge[0]?.id) },
+    { id: 'weapons', icon: 'target', label: 'Weapons', status: `${equippedWeapons(run.player).length} of ${run.player.weaponSlotsMax}`, x: 72, y: 186, onClick: onOpenLoadout },
+    { id: 'shields', icon: 'shield', label: 'Shields', status: `${run.player.shields}/${run.player.shieldsMax}`, x: 188, y: 186, onClick: onOpenLoadout },
+    { id: 'quarters', icon: 'crew', label: 'Quarters', status: `${run.crew.length} of ${run.player.crewCapacity}`, x: 130, y: 290, onClick: () => onOpenCrew(stations.quarters[0]?.id || run.crew[0]?.id) },
+    { id: 'engines', icon: 'engine', label: 'Engines', status: `Speed ${playerSpeedValue(run)}`, x: 130, y: 384, onClick: onOpenLoadout },
+  ]
+  const viewportHeight = typeof window === 'undefined' ? 844 : window.innerHeight
+  const scale = clamp((viewportHeight - 380) / 460, 0.6, 1)
+  return (
+    <div className="relative mx-auto" style={{ width: 260 * scale, height: 460 * scale }}>
+    <div className="absolute left-0 top-0 h-[460px] w-[260px] origin-top-left" style={{ transform: `scale(${scale})` }}>
+      <svg width="260" height="460" viewBox="0 0 260 460" className="absolute inset-0" role="img" aria-label={`${run.shipName} seen from above`}>
+        <polygon points="130,0 200,90 226,220 220,360 180,430 80,430 40,360 34,220 60,90" fill="#0C1626" stroke="#46E0FF" strokeOpacity="0.45" strokeWidth="1.5" strokeLinejoin="round" />
+        <ellipse cx="100" cy="442" rx="14" ry="10" fill="#46E0FF" fillOpacity="0.35" />
+        <ellipse cx="160" cy="442" rx="14" ry="10" fill="#46E0FF" fillOpacity="0.35" />
+      </svg>
+      {nodes.map((node) => (
+        <button key={node.id} type="button" onClick={node.onClick} className="absolute flex w-[84px] flex-col items-center gap-1" style={{ left: node.x - 42, top: node.y - 30 }}>
+          <span className="relative flex h-[60px] w-[60px] items-center justify-center rounded-full bg-raised text-accent">
+            <Icon name={node.icon} size={26} />
+            {(stations[node.id] || []).slice(0, 3).map((member, badgeIndex) => (
+              <span key={member.id} className="absolute flex h-6 w-6 items-center justify-center rounded-full bg-accent font-display text-[10px] font-bold text-accent-ink" style={{ top: -4 + badgeIndex * 20, right: -10 }}>{member.name.slice(0, 2).toUpperCase()}</span>
+            ))}
+          </span>
+          <span className="text-[13px] leading-tight text-ink">{node.label}</span>
+          <span className="text-[11px] leading-tight text-mute">{node.status}</span>
+        </button>
+      ))}
+    </div>
+    </div>
+  )
+}
+
+function ChoiceButton({ title, note, onClick, highlight = null, disabled = false }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex min-h-[64px] w-full flex-col justify-center gap-0.5 rounded-[18px] px-[18px] py-2.5 text-left transition-transform active:scale-[0.99] disabled:opacity-40 ${highlight ? 'border-2 border-accent bg-accent/10' : 'bg-panel'}`}
+    >
+      <span className={`font-display text-[17px] font-semibold ${highlight ? 'text-accent' : 'text-ink'}`}>{title}</span>
+      {highlight || note ? <span className="text-[14px] text-mute">{[highlight ? `Unlocked by ${highlight}` : null, note].filter(Boolean).join(' · ')}</span> : null}
+    </button>
+  )
+}
+
+function OverlayFrame({ children, tone = 'accent', icon = 'signal' }) {
+  const colour = TONE_HEX[tone] || TONE_HEX.accent
+  return (
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-space">
+      <div className="mx-auto flex min-h-[100dvh] w-full max-w-[480px] flex-col px-4 pb-6">
+        <div className="relative -mx-4 flex h-[220px] items-center justify-center overflow-hidden" aria-hidden="true">
+          <svg width="390" height="220" viewBox="0 0 390 220">
+            <circle cx="195" cy="110" r="22" fill={colour} fillOpacity="0.22" />
+            <circle cx="195" cy="110" r="44" fill="none" stroke={colour} strokeOpacity="0.35" />
+            <circle cx="195" cy="110" r="72" fill="none" stroke={colour} strokeOpacity="0.16" />
+            <circle cx="195" cy="110" r="104" fill="none" stroke={colour} strokeOpacity="0.08" />
+          </svg>
+          <span className="absolute" style={{ color: colour }}><Icon name={icon} size={34} /></span>
+        </div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function EventOverlay({ event, onChoose }) {
+  return (
+    <OverlayFrame tone="fuel" icon="hail">
+      <h1 className="m-0 font-display text-[30px] font-bold leading-tight">{String(event.title || '').replace(/^Random event:\s*/i, '').replace(/^\w/, (char) => char.toUpperCase())}</h1>
+      <p className="mb-0 mt-2 text-[17px] leading-relaxed text-[#C2CEDF]">{event.description}</p>
+      <div className="flex-1" />
+      <div className="mt-6 flex flex-col gap-2.5">
+        {event.choices.map((choice) => <ChoiceButton key={choice.id} title={choice.label} note={choice.note} highlight={choice.requirement || null} onClick={() => onChoose(choice.id)} />)}
+      </div>
+    </OverlayFrame>
+  )
+}
+
+function OutcomeOverlay({ outcome, onClose }) {
+  const tone = outcome.tone === 'rose' ? 'hostile' : outcome.tone === 'amber' ? 'fuel' : outcome.tone === 'green' ? 'exit' : 'accent'
+  return (
+    <OverlayFrame tone={tone} icon={tone === 'hostile' ? 'attack' : 'check'}>
+      <h1 className="m-0 font-display text-[28px] font-bold leading-tight">{outcome.title}</h1>
+      {outcome.text ? <p className="mb-0 mt-2 text-[17px] leading-relaxed text-[#C2CEDF]">{outcome.text}</p> : null}
+      {Array.isArray(outcome.details) && outcome.details.length > 0 ? (
+        <div className="mt-5 flex flex-col gap-2">
+          {outcome.details.map((detail, index) => <div key={`${detail}_${index}`} className="rounded-[14px] bg-panel px-4 py-3 font-num text-[17px] font-semibold uppercase tracking-[0.06em]">{detail}</div>)}
+        </div>
+      ) : null}
+      <div className="flex-1" />
+      <PrimaryButton className="mt-6" onClick={onClose}>Continue</PrimaryButton>
+    </OverlayFrame>
+  )
+}
+
+function AdvancementOverlay({ crewMember, level, onChoose }) {
+  return (
+    <OverlayFrame tone="accent" icon="crew">
+      <h1 className="m-0 font-display text-[28px] font-bold leading-tight">{crewMember.name} reached level {level}</h1>
+      <p className="mb-0 mt-2 text-[17px] text-[#C2CEDF]">Pick one perk to improve.</p>
+      <div className="mt-5 flex flex-col gap-4">
+        {CREW_SKILL_IDS.map((skillId) => (
+          <div key={skillId}>
+            <Label className="mb-2">{skillLabel(skillId)} · level {crewSkillLevel(crewMember, skillId)}</Label>
+            <div className="grid grid-cols-3 gap-2">
+              {CREW_SKILL_DEFS[skillId].perks.map((perk) => (
+                <button key={perk.id} type="button" onClick={() => onChoose(skillId, perk.id)} className="flex min-h-[64px] flex-col items-start justify-center rounded-[14px] bg-panel px-3 py-2 text-left">
+                  <span className="text-[14px] font-semibold leading-tight">{perk.label}</span>
+                  <span className="font-num text-[13px] text-mute">{crewPerkLevel(crewMember, skillId, perk.id)}/5</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </OverlayFrame>
+  )
+}
+
+function Toast({ message }) {
+  if (!message) return null
+  return (
+    <div className="pointer-events-none fixed inset-x-0 top-3 z-[60] flex justify-center px-4" role="status" aria-live="polite">
+      <div className="max-w-[440px] rounded-[16px] bg-raised px-4 py-3 text-[14px] text-ink shadow-[0_10px_30px_rgba(0,0,0,0.5)]">{message}</div>
+    </div>
+  )
+}
+
+function HereSheetContent({ run, setRun, current, closeSheet }) {
+  const act = (fn) => setRun((prev) => fn(prev))
+  const npcsHere = (run.system.npcs || []).filter((npc) => npc.currentNodeId === current.id)
+  const isStation = ['station', 'base_arrival', 'base_departure'].includes(current.kind)
+  return (
+    <div className="flex flex-col gap-5">
+      {current.description ? <p className="m-0 text-[15px] leading-relaxed text-soft">{current.description}</p> : null}
+      {isStation ? (
+        <div>
+          <div className="mb-3 flex gap-6 text-[15px] text-soft">
+            <span><strong className="font-num text-[20px] text-ink">{run.resources.scrap}</strong> scrap</span>
+            <span><strong className="font-num text-[20px] text-ink">{run.resources.parts}</strong> parts</span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {stationServiceTiles(run).map((tile) => <Tile key={tile.id} icon={tile.icon} tone={tile.tone} title={tile.title} detail={tile.detail} note={tile.note} disabled={tile.disabled} onClick={() => act(tile.act)} />)}
+          </div>
+        </div>
+      ) : null}
+      {current.kind === 'base_arrival' ? <div className="flex items-center gap-3 rounded-[16px] bg-raised p-4 text-[15px] text-fuel"><Icon name="lock" />You arrived here. Leave from one of the other Cardinal stations.</div> : null}
+      {current.kind === 'base_departure' || current.kind === 'base_arrival' ? <RouteCards run={run} setRun={setRun} current={current} closeSheet={closeSheet} /> : null}
+      {current.kind === 'belt' ? <PrimaryButton tone="fuel" disabled={!hasMiningLaser(run)} onClick={() => act(mineAsteroidBelt)}>{hasMiningLaser(run) ? 'Mine the belt' : 'Needs a mining laser'}</PrimaryButton> : null}
+      {current.kind === 'depot' ? <PrimaryButton tone="fuel" disabled={Boolean(current.salvaged)} onClick={() => act(salvageSupplyDepot)}>{current.salvaged ? 'Already salvaged' : 'Salvage the depot'}</PrimaryButton> : null}
+      {current.kind === 'anomaly' ? <PrimaryButton disabled={Boolean(current.spent)} onClick={() => act(probeAnomaly)}>{current.spent ? 'Already probed' : 'Probe the anomaly'}</PrimaryButton> : null}
+      {current.kind === 'relay' ? <PrimaryButton disabled={Boolean(current.spent)} onClick={() => act(queryNavigationRelay)}>{current.spent ? 'Already queried' : 'Query the relay'}</PrimaryButton> : null}
+      {current.kind === 'merchant' ? <PrimaryButton tone="fuel" onClick={() => act((prev) => openMerchantExchange(prev, current.id, 'node'))}>Trade</PrimaryButton> : null}
+      {current.kind === 'shipyard' ? <ShipyardContent run={run} setRun={setRun} /> : null}
+      {npcsHere.length > 0 ? (
+        <div className="flex flex-col gap-2">
+          <Label>Ships here</Label>
+          {npcsHere.map((npc) => (
+            <div key={npc.id} className="flex items-center gap-3 rounded-[16px] bg-raised p-3">
+              <span style={{ color: TONE_HEX[NPC_TONE[npc.kind] || 'neutral'] }}><Icon name={npc.kind === 'merchant' ? 'trade' : npc.kind === 'civilian' ? 'ship' : 'attack'} /></span>
+              <div className="min-w-0 flex-1"><div className="font-display text-[16px] font-semibold">{npc.name}</div><div className="text-[13px] text-mute">{CONTACT_SHIP_META[npc.kind].label}</div></div>
+              <IconButton icon="hail" label={`Hail ${npc.name}`} className="bg-panel" onClick={() => act((prev) => hailNpcShip(prev, npc.id))} />
+              <IconButton icon="attack" label={`Attack ${npc.name}`} className="bg-panel text-hostile-soft" onClick={() => act((prev) => attackNpcShip(prev, npc.id, `Attacked ${npc.name} from open space.`))} />
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function RouteCards({ run, setRun, current, closeSheet }) {
+  const departures = run.system.nodes.filter((node) => node.kind === 'base_departure')
+  const lastSystem = run.systemIndex === MASTER.maxSystems
+  const [picked, setPicked] = useState(current.kind === 'base_departure' ? current.departureIndex : null)
+  const pickedPreview = picked !== null ? run.system.candidatePreviews[picked] : null
+  const hereIndex = current.kind === 'base_departure' ? current.departureIndex : null
+  const pickedNode = departures.find((node) => node.departureIndex === picked) || null
+  return (
+    <div className="flex flex-col gap-3">
+      <Label>{lastSystem ? 'Final exit' : 'Next system'}</Label>
+      <div className="flex items-center gap-1.5" aria-label={`System ${run.systemIndex} of ${MASTER.maxSystems}`}>
+        {Array.from({ length: MASTER.maxSystems }, (_, index) => <span key={index} className={`h-1.5 rounded-full ${index + 1 <= run.systemIndex ? 'w-6 bg-accent' : 'flex-1 bg-ink/15'}`} />)}
+      </div>
+      {lastSystem ? null : departures.map((node) => {
+        const index = node.departureIndex
+        const preview = run.system.candidatePreviews[index]
+        if (!preview) return null
+        const threatTone = preview.threat === 'High' ? 'text-hostile-soft' : 'text-soft'
+        return (
+          <button key={preview.seed} type="button" onClick={() => setPicked(index)} className={`flex min-h-[88px] items-center justify-between gap-3 rounded-[20px] border-2 bg-raised px-4 text-left ${picked === index ? 'border-accent' : 'border-transparent'}`}>
+            <span className="flex flex-col gap-1">
+              <span className="text-[12px] text-mute">Via Cardinal Station D{index + 1}{hereIndex === index ? ' · you are here' : ''}</span>
+              <span className="font-display text-[19px] font-bold">{preview.name}</span>
+              <span className={`text-[14px] ${threatTone}`}>{preview.type} · {String(preview.threat).toLowerCase()} threat</span>
+            </span>
+            <span className="font-num text-[22px] font-bold text-fuel">{preview.transitFuel}<span className="text-[13px] text-mute"> fuel</span></span>
+          </button>
+        )
+      })}
+      {pickedPreview ? <p className="m-0 text-[15px] text-soft">{pickedPreview.note}</p> : null}
+      {hereIndex !== null && (picked === hereIndex || lastSystem) ? (
+        <PrimaryButton tone="exit" onClick={() => { closeSheet(); setRun((prev) => travelToNextSystem(prev, hereIndex)) }}>{lastSystem ? 'Complete the run' : `Depart · ${run.system.candidatePreviews[hereIndex]?.transitFuel ?? '?'} fuel`}</PrimaryButton>
+      ) : pickedNode ? (
+        <PrimaryButton onClick={() => { closeSheet(); setRun((prev) => ({ ...prev, selectedNodeId: pickedNode.id, ui: { ...prev.ui, view: 'map', sheet: null, selectedNpcId: null } })) }}>Set course to D{picked + 1}</PrimaryButton>
+      ) : null}
+    </div>
+  )
+}
+
+function ShipyardContent({ run, setRun }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <Label>New hulls</Label>
+      {Object.entries(SHIP_PRESETS).map(([shipClass, preset]) => {
+        const netPrice = shipyardNetPrice(run, shipClass)
+        const isCurrent = shipClass === run.player.shipClass
+        const blocked = isCurrent || run.crew.length > preset.crewCapacity || cargoUsed(run) > preset.cargoCapacity || equippedWeapons(run.player).length > preset.weaponSlots || currentPowerUsage(run) > preset.maxPower || run.resources.credits < netPrice
+        return (
+          <div key={shipClass} className="flex items-center gap-3 rounded-[16px] bg-raised p-3">
+            <div className="min-w-0 flex-1"><div className="font-display text-[16px] font-semibold">{shipClass}</div><div className="text-[13px] text-mute">Hull {preset.hullMax} · cargo {preset.cargoCapacity} · {isCurrent ? 'current hull' : `${netPrice} cr after trade-in`}</div></div>
+            <SecondaryButton disabled={blocked} onClick={() => setRun((prev) => buyShipAtShipyard(prev, shipClass))}>{isCurrent ? 'Owned' : 'Buy'}</SecondaryButton>
+          </div>
+        )
+      })}
+      <Label className="mt-2">Weapon upgrades</Label>
+      {run.player.weaponSlots.filter(Boolean).length === 0 ? <div className="text-[14px] text-mute">No weapons fitted.</div> : run.player.weaponSlots.map((weapon, index) => {
+        if (!weapon) return null
+        const nextLevel = equipmentLevel((weapon.level || 1) + 1)
+        const creditCost = 22 + nextLevel * 12
+        const partsCost = 2 + nextLevel
+        const maxed = equipmentLevel(weapon.level) >= 5
+        return (
+          <div key={weapon.instanceId} className="flex items-center gap-3 rounded-[16px] bg-raised p-3">
+            <div className="min-w-0 flex-1"><div className="font-display text-[16px] font-semibold">{weapon.name}</div><div className="text-[13px] text-mute">{maxed ? 'Fully upgraded' : `To ${equipmentLevelSuffix(nextLevel)} · ${creditCost} cr · ${partsCost} parts`}</div></div>
+            <SecondaryButton disabled={maxed || run.resources.credits < creditCost || run.resources.parts < partsCost} onClick={() => setRun((prev) => upgradeMountedWeaponAtShipyard(prev, index))}>Upgrade</SecondaryButton>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function TradeSheetContent({ run, setRun, merchantSource }) {
+  const stock = merchantSource?.entity?.stock || []
+  const tab = run.ui.merchantTab === 'sell' ? 'sell' : 'buy'
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex gap-6 text-[15px] text-soft">
+        <span><strong className="font-num text-[20px] text-ink">{run.resources.credits}</strong> credits</span>
+        <span><strong className="font-num text-[20px] text-ink">{cargoFree(run)}</strong> cargo free</span>
+      </div>
+      <div role="tablist" className="grid grid-cols-2 gap-1 rounded-[14px] bg-space p-1">
+        {['buy', 'sell'].map((id) => <button key={id} role="tab" aria-selected={tab === id} type="button" onClick={() => setRun((prev) => setMerchantTab(prev, id))} className={`h-11 rounded-[10px] font-display text-[15px] font-semibold capitalize ${tab === id ? 'bg-raised text-ink' : 'text-mute'}`}>{id}</button>)}
+      </div>
+      {tab === 'buy' ? (
+        stock.length === 0 ? <div className="text-[15px] text-mute">Nothing left to buy.</div> : stock.map((item) => {
+          const definition = EQUIPMENT_CATALOG[item.itemId]
+          const cannotAfford = run.resources.credits < item.price
+          const noSpace = cargoFree(run) < (definition?.size || 1)
+          return (
+            <div key={item.id} className="flex items-center gap-3 rounded-[16px] bg-raised p-3">
+              <span className="flex h-11 w-11 flex-none items-center justify-center rounded-[12px] font-num text-[14px] font-bold text-space" style={{ backgroundColor: definition?.colour || '#94a3b8' }}>{item.itemId === 'Missile_Ammo' ? `M${equipmentLevel(item.missileLevel || item.level)}` : definition?.icon}</span>
+              <div className="min-w-0 flex-1"><div className="font-display text-[15px] font-semibold">{equipmentDisplayName(item.itemId, item.level || item.missileLevel || 1, item.itemId === 'Missile_Ammo' ? item.amount : null)}</div><div className="text-[13px] text-mute">{cannotAfford ? 'Not enough credits' : noSpace ? 'No cargo space' : `${item.price} credits`}</div></div>
+              <SecondaryButton disabled={cannotAfford || noSpace} onClick={() => setRun((prev) => buyMerchantItem(prev, merchantSource.entity.id, item.id))}>Buy</SecondaryButton>
+            </div>
+          )
+        })
+      ) : (
+        run.cargo.length === 0 ? <div className="text-[15px] text-mute">No stored equipment to sell.</div> : run.cargo.map((item) => {
+          const definition = EQUIPMENT_CATALOG[item.itemId]
+          const salePrice = Math.max(3, Math.floor(equipmentPrice(definition, item.level || item.missileLevel || 1) * 0.65))
+          return (
+            <div key={item.id} className="flex items-center gap-3 rounded-[16px] bg-raised p-3">
+              <span className="flex h-11 w-11 flex-none items-center justify-center rounded-[12px] font-num text-[14px] font-bold text-space" style={{ backgroundColor: definition?.colour || '#94a3b8' }}>{item.itemId === 'Missile_Ammo' ? `M${equipmentLevel(item.missileLevel || item.level)}` : definition?.icon}</span>
+              <div className="min-w-0 flex-1"><div className="font-display text-[15px] font-semibold">{equipmentDisplayName(item.itemId, item.level || item.missileLevel || 1, item.itemId === 'Missile_Ammo' ? item.amount : null)}</div><div className="text-[13px] text-mute">{salePrice} credits</div></div>
+              <SecondaryButton onClick={() => setRun((prev) => sellCargoItem(prev, merchantSource.entity.id, item.id))}>Sell</SecondaryButton>
+            </div>
+          )
+        })
+      )}
+    </div>
+  )
+}
+
+function LoadoutSheetContent({ run, setRun, cargoEntries }) {
+  const [selected, setSelected] = useState(null)
+  const firstEmptySlot = run.player.weaponSlots.findIndex((slot) => !slot)
+  const stats = [
+    ['Hull', `${run.player.hull}/${run.player.hullMax}`], ['Shields', `${run.player.shields}/${run.player.shieldsMax}`], ['Armour', run.player.armour],
+    ['Speed', playerSpeedValue(run)], ['Stealth', playerStealthValue(run)], ['Power', `${currentPowerUsage(run)}/${run.player.maxPower}`],
+    ['Fuel', fuelStorageSummary(run)], ['Ammo', run.resources.kinetic_ammo || 0], ['Cargo', `${cargoUsed(run)}/${run.player.cargoCapacity}`],
+  ]
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="grid grid-cols-3 gap-2">
+        {stats.map(([label, value]) => <div key={label} className="rounded-[14px] bg-raised px-3 py-2"><div className="text-[12px] text-mute">{label}</div><div className="font-num text-[18px] font-bold">{value}</div></div>)}
+      </div>
+      <div className="flex flex-col gap-2">
+        <Label>Weapons · {currentPowerUsage(run)}/{run.player.maxPower} power</Label>
+        {run.player.weaponSlots.map((weapon, index) => {
+          const isSelected = selected?.kind === 'slot' && selected.index === index
+          if (!weapon) {
+            return <div key={`empty_${index}`} className="flex min-h-[56px] items-center rounded-[16px] border border-dashed border-line px-4 text-[14px] text-mute">Empty hardpoint {index + 1}</div>
+          }
+          return (
+            <div key={weapon.instanceId} className={`rounded-[16px] bg-raised ${isSelected ? 'ring-2 ring-accent' : ''}`}>
+              <button type="button" onClick={() => setSelected(isSelected ? null : { kind: 'slot', index })} className="flex min-h-[56px] w-full items-center gap-3 px-4 text-left">
+                <div className="min-w-0 flex-1"><div className="font-display text-[15px] font-semibold">{weapon.name}</div><div className="text-[13px] text-mute">Damage {weapon.damage} · {Math.round((weapon.accuracy || 0) * 100)}% · {equipmentPowerDraw(weapon.id)} power{weapon.broken ? ' · broken' : ''}</div></div>
+                <span className="font-num text-[14px] text-mute">{Math.round(weapon.hp || 0)}/{weapon.maxHp}</span>
+              </button>
+              {isSelected ? (
+                <div className="flex gap-2 px-4 pb-3">
+                  {weapon.broken ? <SecondaryButton tone="fuel" onClick={() => setRun((prev) => repairBrokenWeapon(prev, index))}>Repair ({brokenWeaponRepairCost(run, weapon).parts}p · {brokenWeaponRepairCost(run, weapon).scrap}s)</SecondaryButton> : null}
+                  <SecondaryButton onClick={() => { setSelected(null); setRun((prev) => moveWeaponSlotToCargo(prev, index)) }}>Move to cargo</SecondaryButton>
+                </div>
+              ) : null}
+            </div>
+          )
+        })}
+      </div>
+      <div className="flex flex-col gap-2">
+        <Label>Cargo · {cargoFree(run)} free</Label>
+        {cargoEntries.length === 0 ? <div className="text-[14px] text-mute">The hold is empty.</div> : cargoEntries.map((entry) => {
+          const isSelected = selected?.kind === 'cargo' && selected.key === entry.key
+          const canInstall = entry.kind === 'equipment' && entry.draggable && firstEmptySlot >= 0
+          return (
+            <div key={entry.key} className={`rounded-[16px] bg-raised ${isSelected ? 'ring-2 ring-accent' : ''}`}>
+              <button type="button" onClick={() => setSelected(isSelected ? null : { kind: 'cargo', key: entry.key })} className="flex min-h-[56px] w-full items-center gap-3 px-3 text-left">
+                <span className="flex h-10 w-10 flex-none items-center justify-center rounded-[12px] font-num text-[13px] font-bold text-space" style={{ backgroundColor: entry.colour || '#FFB443' }}>{entry.icon}</span>
+                <div className="min-w-0 flex-1"><div className="font-display text-[15px] font-semibold">{entry.title}</div><div className="text-[13px] text-mute">{entry.subtitle}</div></div>
+              </button>
+              {isSelected ? (
+                <div className="flex flex-col gap-2 px-4 pb-3">
+                  <div className="text-[14px] text-soft">{entry.description}</div>
+                  {entry.kind === 'equipment' && entry.draggable ? <SecondaryButton disabled={!canInstall} onClick={() => { setSelected(null); setRun((prev) => moveCargoWeaponToSlot(prev, entry.key, firstEmptySlot)) }}>{canInstall ? `Fit to hardpoint ${firstEmptySlot + 1}` : 'No free hardpoint'}</SecondaryButton> : null}
+                </div>
+              ) : null}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function CrewSheetContent({ run, setRun, dockedAtCardinalBase }) {
+  const [confirmId, setConfirmId] = useState(null)
+  const selectedId = run.ui.selectedCrewId
+  return (
+    <div className="flex flex-col gap-2">
+      {run.crew.length === 0 ? <div className="text-[15px] text-mute">No crew remain aboard.</div> : run.crew.map((member) => {
+        const open = member.id === selectedId
+        const skills = CREW_SKILL_IDS.filter((skillId) => crewSkillLevel(member, skillId) > 0)
+        return (
+          <div key={member.id} className={`rounded-[18px] bg-raised ${open ? 'ring-2 ring-accent' : ''}`}>
+            <button type="button" onClick={() => setRun((prev) => selectCrewMember(prev, open ? null : member.id))} className="flex min-h-[64px] w-full items-center gap-3 px-4 text-left">
+              <span className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-accent font-display text-[13px] font-bold text-accent-ink">{member.name.slice(0, 2).toUpperCase()}</span>
+              <div className="min-w-0 flex-1">
+                <div className="font-display text-[16px] font-semibold">{member.name}</div>
+                <div className="text-[13px] text-mute">{crewRoleLabel(member.role)} · level {crewLevel(member)}{crewHasWantedStatus(member) ? ' · wanted' : ''}</div>
+              </div>
+              <span className="h-1.5 w-12 overflow-hidden rounded-full bg-hostile/20"><span className="block h-full bg-hostile" style={{ width: `${((member.health || 0) / Math.max(1, member.healthMax || 1)) * 100}%` }} /></span>
+            </button>
+            {open ? (
+              <div className="flex flex-col gap-3 px-4 pb-4">
+                <div className="text-[14px] text-soft">{crewDescription(member)}</div>
+                <div className="grid grid-cols-3 gap-2 text-center">
+                  <div className="rounded-[12px] bg-panel py-2"><div className="font-num text-[17px] font-bold">{member.xp}</div><div className="text-[12px] text-mute">XP</div></div>
+                  <div className="rounded-[12px] bg-panel py-2"><div className="font-num text-[17px] font-bold">{xpToNextCrewLevel(member) > 0 ? xpToNextCrewLevel(member) : 'Max'}</div><div className="text-[12px] text-mute">to next level</div></div>
+                  <div className="rounded-[12px] bg-panel py-2"><div className="font-num text-[17px] font-bold">{member.health || 0}/{member.healthMax || 0}</div><div className="text-[12px] text-mute">health</div></div>
+                </div>
+                {skills.length > 0 ? skills.map((skillId) => (
+                  <div key={skillId} className="text-[14px] text-soft"><span className="text-ink">{skillLabel(skillId)} {crewSkillLevel(member, skillId)}</span> · {CREW_SKILL_DEFS[skillId].perks.map((perk) => `${perk.label} ${crewPerkLevel(member, skillId, perk.id)}`).join(' · ')}</div>
+                )) : <div className="text-[14px] text-mute">No specialisations yet.</div>}
+                {crewHasWantedStatus(member) ? <div className="text-[14px] text-hostile-soft">Wanted for {member.wantedReason}.</div> : null}
+                {confirmId === member.id ? (
+                  <div className="flex gap-2">
+                    <SecondaryButton tone={dockedAtCardinalBase ? 'fuel' : 'hostile'} onClick={() => { setConfirmId(null); setRun((prev) => removeCrewMember(prev, member.id)) }}>{dockedAtCardinalBase ? 'Confirm disembark' : 'Confirm: this is fatal'}</SecondaryButton>
+                    <SecondaryButton onClick={() => setConfirmId(null)}>Cancel</SecondaryButton>
+                  </div>
+                ) : (
+                  <SecondaryButton tone={dockedAtCardinalBase ? 'fuel' : 'hostile'} onClick={() => setConfirmId(member.id)}>{dockedAtCardinalBase ? 'Disembark here' : 'Eject into space'}</SecondaryButton>
+                )}
+              </div>
+            ) : null}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function LogSheetContent({ run }) {
+  return (
+    <div className="flex flex-col gap-2">
+      {run.log.map((entry, index) => {
+        const entryTurn = extractLogTurn(entry)
+        return (
+          <div key={`${entry}_${index}`} className="rounded-[14px] bg-raised px-4 py-3">
+            {entryTurn !== null ? <div className="font-num text-[12px] font-semibold uppercase tracking-[0.12em] text-mute">Turn {entryTurn}</div> : null}
+            <div className="text-[15px] text-ink">{rawLogText(entry)}</div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function LegendSheetContent({ run }) {
+  const rows = [
+    ['hostile', 'Pirates, patrols and hazards'],
+    ['fuel', 'Stations, merchants and depots'],
+    ['exit', 'Cardinal exits to the next system'],
+    ['neutral', 'Planets, belts, wrecks and signals'],
+    ['accent', 'Waypoints you can jump to'],
+  ]
+  return (
+    <div className="flex flex-col gap-3">
+      {rows.map(([tone, text]) => <div key={tone} className="flex items-center gap-3 text-[15px]"><span className="h-4 w-4 rounded-full" style={{ backgroundColor: TONE_HEX[tone] }} />{text}</div>)}
+      {run.system.meteorPath ? <div className="flex items-center gap-3 text-[15px]"><span className="h-0.5 w-4 bg-fuel" />Meteor stream: {run.system.meteorPath.description}</div> : null}
+      <div className="mt-2 text-[14px] text-mute">Every ring turns after each jump or wait, so plan one move ahead.</div>
+    </div>
+  )
+}
+
+function InfoSheetContent({ run, node, current, risk, travelMode }) {
+  const forecast = node ? orbitForecast(run.system, node) : null
+  return (
+    <div className="flex flex-col gap-3 text-[15px] text-soft">
+      {node?.description ? <p className="m-0 leading-relaxed">{node.description}</p> : null}
+      {node?.opportunity ? <div><span className="text-mute">Opportunity · </span>{node.opportunity}</div> : null}
+      {node?.danger ? <div><span className="text-mute">Danger · </span>{node.danger}</div> : null}
+      <div><span className="text-mute">System · </span>{run.system.type} · police {Math.round((run.system.policePressure || 0) * 100)}% · pirates {Math.round((run.system.piratePressure || 0) * 100)}% · alert {run.system.securityAlert || 0}</div>
+      {risk ? <div><span className="text-mute">Detection on this move · </span>police {Math.round(risk.policeChance * 100)}% · pirates {Math.round(risk.pirateChance * 100)}%{travelMode === 'meteor' ? ' (meteor ride)' : ''}</div> : null}
+      {forecast && node?.id !== current.id ? <div><span className="text-mute">Ring {node.orbit + 1} forecast · </span>segment {forecast.currentGlobalSlot + 1} now, then {forecast.futureSlots.map((slot) => slot + 1).join(' → ')}</div> : null}
+    </div>
+  )
+}
+
+function MenuSheetContent({ run, setRun, onOpen, inCombat = false }) {
+  const [confirm, setConfirm] = useState(false)
+  return (
+    <div className="flex flex-col gap-2">
+      {!inCombat ? <SecondaryButton onClick={() => onOpen('log')}>Ship log</SecondaryButton> : null}
+      {!inCombat ? <SecondaryButton onClick={() => onOpen('legend')}>Map legend</SecondaryButton> : null}
+      <Label className="mt-3">Test tools</Label>
+      <SecondaryButton tone="fuel" onClick={() => setRun((prev) => devGrantResources(prev))}>Grant resources</SecondaryButton>
+      <SecondaryButton tone="fuel" onClick={() => setRun((prev) => devRestoreShip(prev))}>Restore ship</SecondaryButton>
+      {inCombat ? <SecondaryButton tone="fuel" disabled={Boolean(run.combat?.outcome)} onClick={() => setRun((prev) => devForceCombatVictory(prev))}>Force combat victory</SecondaryButton> : null}
+      <Label className="mt-3">Run</Label>
+      {confirm ? (
+        <div className="flex gap-2">
+          <SecondaryButton tone="hostile" onClick={() => abandonRunToMenu(setRun)}>Confirm self-destruct</SecondaryButton>
+          <SecondaryButton onClick={() => setConfirm(false)}>Cancel</SecondaryButton>
+        </div>
+      ) : <SecondaryButton tone="hostile" onClick={() => setConfirm(true)}>Self-destruct and end run</SecondaryButton>}
+    </div>
+  )
+}
+
+const FLEET_HEX = 30
+const FLEET_MARGIN = 14
+
+function fleetGeometry() {
+  const s = FLEET_HEX
+  const m = FLEET_MARGIN
+  const half = (Math.sqrt(3) / 2) * s
+  const axMax = Math.sqrt(3) * s * (HEX_ARENA.cols - 0.5)
+  const width = (1.5 * s * (HEX_ARENA.rows - 1) + 2 * s) + 2 * m
+  const height = axMax + 2 * half + 2 * m
+  const toDisplay = (hex) => {
+    const center = hexArenaCenter(hex.col, hex.row, s)
+    return { x: center.y + s + m, y: axMax + half + m - center.x }
+  }
+  const polygon = (point, radius = s) => Array.from({ length: 6 }, (_, index) => {
+    const angle = (60 * index) * (Math.PI / 180)
+    return `${point.x + radius * Math.cos(angle)},${point.y + radius * Math.sin(angle)}`
+  }).join(' ')
+  return { s, width, height, toDisplay, polygon }
+}
+
+function fleetCentroid(geometry, hexes) {
+  const points = hexes.map((hex) => geometry.toDisplay(hex))
+  const sum = points.reduce((acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }), { x: 0, y: 0 })
+  return { x: sum.x / Math.max(1, points.length), y: sum.y / Math.max(1, points.length) }
+}
+
+function fleetShipCentroid(geometry, side, unitLike) {
+  return fleetCentroid(geometry, hexCombatShipFootprint(buildHexShipUnit(side, unitLike)))
+}
+
+function FleetShipShape({ x, y, side, s, colour, ghost = false, shieldRatio = 0 }) {
+  const path = side === 'player'
+    ? `M0,${-1.25 * s} L${0.72 * s},${0.9 * s} L${0.24 * s},${0.6 * s} L0,${s} L${-0.24 * s},${0.6 * s} L${-0.72 * s},${0.9 * s} Z`
+    : `M0,${1.2 * s} L${0.8 * s},${-0.2 * s} L${0.45 * s},${-0.95 * s} L${-0.45 * s},${-0.95 * s} L${-0.8 * s},${-0.2 * s} Z`
+  return (
+    <g transform={`translate(${x} ${y})`} pointerEvents="none">
+      {!ghost && shieldRatio > 0 ? <ellipse rx={1.2 * s} ry={1.55 * s} fill="none" stroke={colour} strokeOpacity={0.15 + shieldRatio * 0.45} strokeWidth="2" /> : null}
+      <path d={path} fill={ghost ? 'none' : side === 'player' ? '#0F1C2E' : '#2A0E14'} stroke={colour} strokeWidth="2.2" strokeDasharray={ghost ? '5 4' : undefined} strokeLinejoin="round" opacity={ghost ? 0.8 : 1} />
+      {!ghost && side === 'player' ? <circle cy={s} r={0.16 * s} fill={colour} /> : null}
+    </g>
+  )
+}
+
+function FleetDroneShape({ x, y, side, count, s, colour, ghost = false }) {
+  const slots = [[-0.42, -0.28], [0, -0.48], [0.42, -0.28], [-0.42, 0.28], [0, 0.08], [0.42, 0.28]]
+  const point = side === 'player' ? '0,-5 4,4 -4,4' : '0,5 4,-4 -4,-4'
+  return (
+    <g transform={`translate(${x} ${y})`} pointerEvents="none" opacity={ghost ? 0.6 : 1}>
+      <circle r={0.72 * s} fill="none" stroke={colour} strokeOpacity="0.45" strokeWidth="1.2" strokeDasharray={ghost ? '3 3' : undefined} />
+      {slots.slice(0, Math.max(0, count)).map(([dx, dy], index) => <polygon key={index} points={point} transform={`translate(${dx * s} ${dy * s})`} fill={colour} />)}
+    </g>
+  )
+}
+
+function FleetArena({ run, now, onSelectOwn, onTapEnemy, onPlanShip, onPlanSquadron }) {
+  const combat = run.combat
+  const geometry = fleetGeometry()
+  const { s } = geometry
+  const orders = combat.orders || {}
+  const lastRound = combat.lastRound
+  const playing = Boolean(lastRound && now - lastRound.at < FLEET_ROUND_PLAYBACK_MS)
+  const moveProgress = lastRound && playing ? clamp((now - lastRound.at) / FLEET_MOVE_PLAYBACK_MS, 0, 1) : 1
+  const eased = 1 - (1 - moveProgress) * (1 - moveProgress)
+  const planning = fleetCombatActive(run) && !playing && !(lastRound && !lastRound.seen)
+  const selectedEntry = findCombatUnit(run, combat.selectedUnitId)
+  const weaponIndex = Number.isInteger(run.ui.selectedCombatWeaponIndex) ? run.ui.selectedCombatWeaponIndex : null
+
+  const anchorFor = (entry) => {
+    if (!entry) return null
+    const finalPoint = entry.kind === 'ship' ? fleetShipCentroid(geometry, entry.side, entry.unit) : geometry.toDisplay(entry.unit.position)
+    const from = lastRound?.before?.[entry.unit.id]
+    if (!from || eased >= 1) return finalPoint
+    const startPoint = entry.kind === 'ship' ? fleetShipCentroid(geometry, entry.side, { ...entry.unit, col: from.col, row: from.row }) : geometry.toDisplay({ col: from.col, row: from.row })
+    return { x: startPoint.x + (finalPoint.x - startPoint.x) * eased, y: startPoint.y + (finalPoint.y - startPoint.y) * eased }
+  }
+  const plannedAnchor = (entry) => {
+    const move = orders[entry.unit.id]?.move
+    if (!move) return null
+    return entry.kind === 'ship' ? fleetShipCentroid(geometry, entry.side, { ...entry.unit, col: move.col, row: move.row }) : geometry.toDisplay(move)
+  }
+  const playerShip = findCombatUnit(run, combat.playerShipUnit.id)
+  const enemyShip = findCombatUnit(run, combat.enemyShipUnit.id)
+  const squadrons = (combat.squadrons || []).filter((entry) => squadronAliveCount(entry) > 0).map((squadron) => findCombatUnit(run, squadron.id)).filter(Boolean)
+  const shipOptions = planning && selectedEntry?.kind === 'ship' ? fleetShipMoveOptions(run) : []
+  const squadronHexes = planning && selectedEntry?.kind === 'squadron' && selectedEntry.side === 'player' ? fleetSquadronMoveHexes(run, selectedEntry.unit.id) : []
+  const shipFrom = plannedAnchor(playerShip) || anchorFor(playerShip)
+  const activeEffects = (combat.effects || []).filter((effect) => now >= (effect.startedAt || 0) && now - (effect.startedAt || 0) <= (effect.durationMs || 820))
+  const activeFloaters = (combat.floaters || []).filter((entry) => now >= (entry.startedAt || 0) && now - (entry.startedAt || 0) <= (entry.durationMs || 1100))
+
+  return (
+    <svg viewBox={`0 0 ${geometry.width} ${geometry.height}`} className="h-full w-full" preserveAspectRatio="xMidYMid meet" role="img" aria-label={`Battle grid: ${run.shipName} and its drones at the bottom, ${combat.enemy.name} at the top`}>
+      {Array.from({ length: HEX_ARENA.rows }, (_, row) => Array.from({ length: HEX_ARENA.cols }, (_, col) => {
+        const point = geometry.toDisplay({ col, row })
+        return <polygon key={`${col}:${row}`} points={geometry.polygon(point, s - 1)} fill="rgba(140,180,230,0.035)" stroke="rgba(140,190,255,0.12)" strokeWidth="1" />
+      }))}
+
+      {squadronHexes.map((hex) => {
+        const point = geometry.toDisplay(hex)
+        const planned = orders[selectedEntry.unit.id]?.move && hexEquals(orders[selectedEntry.unit.id].move, hex)
+        return <polygon key={`move_${hex.col}_${hex.row}`} points={geometry.polygon(point, s - 2.5)} fill={planned ? 'rgba(70,224,255,0.35)' : 'rgba(70,224,255,0.12)'} stroke="rgba(70,224,255,0.35)" strokeWidth="1" style={{ cursor: 'pointer' }} onClick={() => onPlanSquadron(selectedEntry.unit.id, hex)} />
+      })}
+
+      {shipOptions.map((option) => {
+        const point = fleetShipCentroid(geometry, 'player', { ...combat.playerShipUnit, col: option.col, row: option.row })
+        const planned = orders[combat.playerShipUnit.id]?.move?.col === option.col && orders[combat.playerShipUnit.id]?.move?.row === option.row
+        return (
+          <g key={`ship_opt_${option.col}_${option.row}`} style={{ cursor: 'pointer' }} onClick={() => onPlanShip(option)}>
+            <circle cx={point.x} cy={point.y} r={0.62 * s} fill="transparent" />
+            <circle cx={point.x} cy={point.y} r={0.3 * s} fill={planned ? '#46E0FF' : 'rgba(70,224,255,0.25)'} stroke="#46E0FF" strokeOpacity="0.8" strokeWidth="1.4" data-move-option="ship" />
+          </g>
+        )
+      })}
+
+      {[playerShip, ...squadrons.filter((entry) => entry.side === 'player')].map((entry) => {
+        const target = plannedAnchor(entry)
+        const from = anchorFor(entry)
+        if (!target || !from || !planning) return null
+        return (
+          <g key={`plan_${entry.unit.id}`} pointerEvents="none">
+            <line x1={from.x} y1={from.y} x2={target.x} y2={target.y} stroke="#46E0FF" strokeWidth="2" strokeDasharray="6 6" />
+            {entry.kind === 'ship' ? <FleetShipShape x={target.x} y={target.y} side="player" s={s} colour="#46E0FF" ghost /> : <FleetDroneShape x={target.x} y={target.y} side="player" count={squadronAliveCount(entry.unit)} s={s} colour="#46E0FF" ghost />}
+          </g>
+        )
+      })}
+
+      {planning ? run.player.weaponSlots.map((weapon, index) => {
+        if (!weapon) return null
+        const target = findCombatUnit(run, fleetWeaponTarget(run, weapon))
+        const to = anchorFor(target)
+        if (!to || !shipFrom) return null
+        const selected = index === weaponIndex && selectedEntry?.kind === 'ship'
+        return (
+          <g key={`aim_${weapon.instanceId}`} pointerEvents="none">
+            <line x1={shipFrom.x} y1={shipFrom.y} x2={to.x} y2={to.y} stroke="#46E0FF" strokeOpacity={selected ? 0.9 : 0.25} strokeWidth={selected ? 2.2 : 1.2} strokeDasharray="3 6" />
+            {selected ? <text x={(shipFrom.x + to.x) / 2 + 10} y={(shipFrom.y + to.y) / 2} fill="#46E0FF" fontSize="15" fontWeight="700" fontFamily="'Barlow Condensed', sans-serif">{Math.round((weapon.accuracy || 0) * 100)}%</text> : null}
+          </g>
+        )
+      }) : null}
+
+      {planning && selectedEntry?.kind === 'squadron' && selectedEntry.side === 'player' ? (() => {
+        const target = findCombatUnit(run, fleetSquadronTarget(run, selectedEntry.unit))
+        const from = plannedAnchor(selectedEntry) || anchorFor(selectedEntry)
+        const to = anchorFor(target)
+        if (!from || !to) return null
+        return <line x1={from.x} y1={from.y} x2={to.x} y2={to.y} stroke="#46E0FF" strokeOpacity="0.6" strokeWidth="1.6" strokeDasharray="2 5" pointerEvents="none" />
+      })() : null}
+
+      {[enemyShip, playerShip].map((entry) => {
+        const point = anchorFor(entry)
+        const isPlayer = entry.side === 'player'
+        const entity = isPlayer ? run.player : combat.enemy
+        const selected = planning && combat.selectedUnitId === entry.unit.id
+        const targeted = planning && !isPlayer && (selectedEntry?.kind === 'ship' ? fleetWeaponTarget(run, run.player.weaponSlots[weaponIndex] || null) === entry.unit.id : selectedEntry?.kind === 'squadron' ? fleetSquadronTarget(run, selectedEntry.unit) === entry.unit.id : false)
+        const colour = isPlayer ? '#46E0FF' : '#FF6170'
+        return (
+          <g key={entry.unit.id} style={{ cursor: 'pointer' }} onClick={() => (isPlayer ? onSelectOwn(entry.unit.id) : onTapEnemy(entry.unit.id))}>
+            <circle cx={point.x} cy={point.y} r={1.5 * s} fill="transparent" />
+            {selected ? <circle cx={point.x} cy={point.y} r={1.45 * s} fill={colour} fillOpacity="0.08" stroke={colour} strokeOpacity="0.6" strokeWidth="1.5" /> : null}
+            {targeted ? <path d={`M${point.x - 1.5 * s} ${point.y - 1.1 * s}v${-0.4 * s}h${0.4 * s}M${point.x + 1.1 * s} ${point.y - 1.5 * s}h${0.4 * s}v${0.4 * s}M${point.x + 1.5 * s} ${point.y + 1.1 * s}v${0.4 * s}h${-0.4 * s}M${point.x - 1.1 * s} ${point.y + 1.5 * s}h${-0.4 * s}v${-0.4 * s}`} fill="none" stroke="#FF6170" strokeWidth="2.6" /> : null}
+            <g opacity={entity.hull <= 0 ? 0.3 : 1}><FleetShipShape x={point.x} y={point.y} side={entry.side} s={s} colour={colour} ghost={entity.hull <= 0} shieldRatio={entity.shieldsMax ? entity.shields / entity.shieldsMax : 0} /></g>
+          </g>
+        )
+      })}
+
+      {squadrons.map((entry) => {
+        const point = anchorFor(entry)
+        const isPlayer = entry.side === 'player'
+        const colour = isPlayer ? '#46E0FF' : '#FF6170'
+        const selected = planning && combat.selectedUnitId === entry.unit.id
+        const targeted = planning && !isPlayer && (selectedEntry?.kind === 'squadron' ? fleetSquadronTarget(run, selectedEntry.unit) === entry.unit.id : selectedEntry?.kind === 'ship' ? fleetWeaponTarget(run, run.player.weaponSlots[weaponIndex] || null) === entry.unit.id : false)
+        return (
+          <g key={entry.unit.id} style={{ cursor: 'pointer' }} onClick={() => (isPlayer ? onSelectOwn(entry.unit.id) : onTapEnemy(entry.unit.id))}>
+            <circle cx={point.x} cy={point.y} r={0.95 * s} fill="transparent" />
+            {selected ? <circle cx={point.x} cy={point.y} r={0.95 * s} fill={colour} fillOpacity="0.08" stroke={colour} strokeOpacity="0.6" strokeWidth="1.5" /> : null}
+            {targeted ? <circle cx={point.x} cy={point.y} r={0.95 * s} fill="none" stroke="#FF6170" strokeWidth="2.4" strokeDasharray="5 4" /> : null}
+            <FleetDroneShape x={point.x} y={point.y} side={entry.side} count={squadronAliveCount(entry.unit)} s={s} colour={colour} />
+          </g>
+        )
+      })}
+
+      {activeEffects.map((effect) => {
+        const from = anchorFor(findCombatUnit(run, effect.fromUnitId))
+        const to = anchorFor(findCombatUnit(run, effect.toUnitId))
+        if (!from || !to) return null
+        const progress = clamp((now - effect.startedAt) / Math.max(1, effect.durationMs || 820), 0, 1)
+        const x = from.x + (to.x - from.x) * progress
+        const y = from.y + (to.y - from.y) * progress
+        return (
+          <g key={effect.id} pointerEvents="none" opacity={1 - progress * 0.25}>
+            <line x1={from.x} y1={from.y} x2={x} y2={y} stroke={effect.colour} strokeWidth={effect.kind === 'missile' ? 3 : 2.4} strokeDasharray={effect.kind === 'kinetic' ? '4 6' : undefined} />
+            <circle cx={x} cy={y} r={effect.kind === 'missile' ? 5 : 3.5} fill={effect.colour} />
+            {progress > 0.85 && effect.hit ? <circle cx={to.x} cy={to.y} r={0.7 * s} fill={effect.colour} opacity="0.3" /> : null}
+          </g>
+        )
+      })}
+
+      {activeFloaters.map((floater) => {
+        const point = anchorFor(findCombatUnit(run, floater.targetId))
+        if (!point) return null
+        const progress = clamp((now - floater.startedAt) / Math.max(1, floater.durationMs || 1100), 0, 1)
+        return <text key={floater.id} x={point.x} y={point.y - 1.3 * s - (floater.stackIndex || 0) * 17 - progress * 16} textAnchor="middle" fill={floater.colour} fontSize="16" fontWeight="700" fontFamily="'Barlow Condensed', sans-serif" opacity={1 - progress * 0.85} pointerEvents="none">{floater.text}</text>
+      })}
+    </svg>
+  )
+}
+
+function enemySystemStatus(run) {
+  const enemy = run.combat.enemy
+  const systems = run.combat.enemySystems || {}
+  const weapons = (enemy.weapons || []).filter(Boolean)
+  const crew = enemy.crew || []
+  return {
+    hull: `${Math.round(enemy.hull)}/${enemy.hullMax}`,
+    weapons: `${weapons.filter((weapon) => !weapon.broken).length}/${weapons.length} armed`,
+    shields: systems.shieldLayersDisabled > 0 ? `${systems.shieldLayersDisabled} layer${systems.shieldLayersDisabled === 1 ? '' : 's'} down` : enemy.shields > 0 ? 'online' : 'drained',
+    engines: (systems.engineDamage || 0) > 0 ? `damaged ${systems.engineDamage}` : 'online',
+    crew: `${crew.filter((member) => (member.health ?? 1) > 0).length}/${crew.length} standing`,
+  }
+}
+
+function weaponShortName(weapon) {
+  return String(weapon?.name || '').replace(/ Mk \d+$/, '').replace(/ I$/, '')
+}
+
+function weaponStateLabel(run, weapon) {
+  if (weapon.broken) return 'Broken'
+  if (weapon.enabled === false) return 'Unpowered'
+  if (weapon.ammoType === 'missile' && (weapon.ammoLeft || 0) <= 0) return 'Reloading'
+  if (weapon.ammoType && weapon.ammoType !== 'missile' && (run.resources[weapon.ammoType] || 0) <= 0) return 'No ammo'
+  if ((weapon.hexReadyIn || 0) > 0) return 'Cooling'
+  return null
+}
+
+function FleetCombatScreen({ run, setRun, now }) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [logOpen, setLogOpen] = useState(false)
+  const combat = run.combat
+  const enemy = combat.enemy
+  const lastRound = combat.lastRound
+  const playing = Boolean(lastRound && now - lastRound.at < FLEET_ROUND_PLAYBACK_MS)
+  const showSummary = Boolean(lastRound && !lastRound.seen && !playing)
+  const selectedEntry = findCombatUnit(run, combat.selectedUnitId)
+  const weaponIndex = Number.isInteger(run.ui.selectedCombatWeaponIndex) ? run.ui.selectedCombatWeaponIndex : null
+  const selectedWeapon = weaponIndex !== null ? run.player.weaponSlots[weaponIndex] : null
+  const playerSquadron = activeSquadron(combat, 'player')
+  const enemyUnits = combatUnitSummaries(run, 'enemy')
+  const enemyLayers = shieldLayerCount({ shieldsMax: enemy.shieldsMax, shields: enemy.shields })
+  const enemyCharged = chargedShieldLayers({ shieldsMax: enemy.shieldsMax, shields: enemy.shields })
+  const shipOrder = combat.orders?.[combat.playerShipUnit.id]?.move
+  const squadronOrder = playerSquadron ? combat.orders?.[playerSquadron.id] : null
+  const status = enemySystemStatus(run)
+  const act = (fn) => setRun((prev) => fn(prev))
+  const tapEnemy = (unitId) => {
+    if (!fleetCombatActive(run)) return
+    if (selectedEntry?.kind === 'squadron' && selectedEntry.side === 'player') act((prev) => aimFleetSquadron(prev, selectedEntry.unit.id, unitId))
+    else act((prev) => aimFleetWeapon(selectFleetWeapon(prev, weaponIndex ?? prev.player.weaponSlots.findIndex(Boolean)), weaponIndex ?? prev.player.weaponSlots.findIndex(Boolean), unitId))
+  }
+  const weaponTargetEntry = selectedWeapon ? findCombatUnit(run, fleetWeaponTarget(run, selectedWeapon)) : null
+  const fleeChance = Math.round(escapeChanceAgainst(run, enemy.kind) * 100)
+
+  const roundLines = lastRound && !lastRound.seen ? lastRound.summary : []
+  const summaryList = roundLines.length > 0 ? (
+    <div className="flex flex-col gap-2">
+      {roundLines.map((line, index) => (
+        <div key={index} className="flex items-center gap-2.5 text-[16px]"><span className={`h-2 w-2 flex-none rounded-full ${line.tone === 'good' ? 'bg-accent' : line.tone === 'bad' ? 'bg-hostile' : 'bg-mute'}`} />{line.text}</div>
+      ))}
+    </div>
+  ) : null
+
+  let panel
+  if (playing) {
+    const progress = clamp((now - lastRound.at) / FLEET_ROUND_PLAYBACK_MS, 0, 1)
+    panel = (
+      <div className="flex flex-col gap-3 py-2">
+        <div className="font-display text-[18px] font-semibold tracking-[0.08em]">Executing round {lastRound.number}</div>
+        <div className="h-1.5 overflow-hidden rounded-full bg-accent/20"><div className="h-full rounded-full bg-accent" style={{ width: `${progress * 100}%` }} /></div>
+      </div>
+    )
+  } else if (combat.outcome) {
+    const reward = Object.entries(combat.outcome.reward || {}).filter(([, value]) => value).map(([key, value]) => `+${value} ${key}`).join(' · ')
+    panel = (
+      <div className="flex flex-col gap-3">
+        {summaryList}
+        <div className="font-display text-[22px] font-bold">{combat.outcome.title}</div>
+        {reward ? <div className="text-[16px] text-exit">{reward}</div> : null}
+        <PrimaryButton onClick={() => act(continueAfterCombat)}>Continue</PrimaryButton>
+      </div>
+    )
+  } else if (combat.negotiation) {
+    panel = (
+      <div className="flex flex-col gap-3">
+        <div className="font-display text-[18px] font-semibold">{combat.negotiation.side === 'enemy' ? 'They want out' : 'Counteroffer'}</div>
+        <div className="text-[15px] text-soft">{combat.negotiation.text}</div>
+        <div className="flex gap-2.5">
+          <SecondaryButton className="h-[60px] flex-1 rounded-[18px]" onClick={() => act((prev) => resolveHexCombatNegotiation(prev, 'reject'))}>Reject</SecondaryButton>
+          <PrimaryButton className="flex-1" tone="exit" onClick={() => act((prev) => resolveHexCombatNegotiation(prev, 'accept'))}>{combat.negotiation.side === 'enemy' ? 'Accept' : 'Pay'}</PrimaryButton>
+        </div>
+      </div>
+    )
+  } else if (showSummary) {
+    panel = (
+      <div className="flex flex-col gap-3">
+        {summaryList}
+        <PrimaryButton onClick={() => act(acknowledgeFleetRound)}>Next round</PrimaryButton>
+      </div>
+    )
+  } else {
+    const shipSelected = selectedEntry?.kind === 'ship'
+    const squadronSelected = selectedEntry?.kind === 'squadron' && selectedEntry.side === 'player'
+    panel = (
+      <div className="flex flex-col gap-3">
+        <div className="grid grid-cols-2 gap-2.5" role="radiogroup" aria-label="Your fleet">
+          <button type="button" role="radio" aria-checked={shipSelected} onClick={() => act((prev) => selectFleetUnit(prev, prev.combat.playerShipUnit.id))} className={`flex min-h-[76px] flex-col justify-between gap-1 rounded-[18px] border-2 bg-panel px-3.5 py-2.5 text-left ${shipSelected ? 'border-accent' : 'border-transparent'}`}>
+            <span className="flex items-baseline justify-between gap-2"><span className="truncate font-display text-[16px] font-semibold">{run.shipName}</span><span className="font-num text-[14px] text-soft">{run.player.hull}/{run.player.hullMax}</span></span>
+            <span className={`text-[13px] ${shipOrder ? 'text-accent' : 'text-mute'}`}>{shipOrder ? 'Move set' : combat.playerShipUnit.actionsRemaining > 0 ? 'Tap a circle to move' : 'Engines spent'} · shields {run.player.shields}</span>
+            <span className="h-1 overflow-hidden rounded-full bg-ink/15"><span className="block h-full rounded-full bg-ink" style={{ width: `${(run.player.hull / Math.max(1, run.player.hullMax)) * 100}%` }} /></span>
+          </button>
+          {playerSquadron ? (
+            <button type="button" role="radio" aria-checked={squadronSelected} onClick={() => act((prev) => selectFleetUnit(prev, playerSquadron.id))} className={`flex min-h-[76px] flex-col justify-between gap-1 rounded-[18px] border-2 bg-panel px-3.5 py-2.5 text-left ${squadronSelected ? 'border-accent' : 'border-transparent'}`}>
+              <span className="flex items-baseline justify-between gap-2"><span className="font-display text-[16px] font-semibold">Drones</span><span className="font-num text-[14px] text-soft">{squadronAliveCount(playerSquadron)}/{DRONE_SQUADRON_SIZE}</span></span>
+              <span className={`text-[13px] ${squadronOrder?.move ? 'text-accent' : 'text-mute'}`}>{playerSquadron.launchedTurn === combat.turnNumber ? 'Launching this round' : squadronOrder?.move ? 'Move set' : 'Tap a hex to move'}</span>
+              <span className="h-1 overflow-hidden rounded-full bg-ink/15"><span className="block h-full rounded-full bg-ink" style={{ width: `${(squadronAliveCount(playerSquadron) / DRONE_SQUADRON_SIZE) * 100}%` }} /></span>
+            </button>
+          ) : (
+            <button type="button" disabled={(combat.droneBayCooldown || 0) > 0} onClick={() => act(launchHexCombatSquadron)} className="flex min-h-[76px] flex-col justify-center gap-1 rounded-[18px] border-2 border-dashed border-accent/50 px-3.5 text-left text-accent disabled:border-line disabled:text-mute">
+              <span className="font-display text-[16px] font-semibold">Launch drones</span>
+              <span className="text-[13px] text-mute">{(combat.droneBayCooldown || 0) > 0 ? `Bay ready in ${combat.droneBayCooldown}` : `${DRONE_SQUADRON_SIZE} drones ready`}</span>
+            </button>
+          )}
+        </div>
+        {shipSelected ? (
+          <>
+            <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(1, run.player.weaponSlots.filter(Boolean).length)}, minmax(0, 1fr))` }} role="radiogroup" aria-label="Weapons">
+              {run.player.weaponSlots.map((weapon, index) => {
+                if (!weapon) return null
+                const blocked = weaponStateLabel(run, weapon)
+                const target = findCombatUnit(run, fleetWeaponTarget(run, weapon))
+                const aimText = !target ? 'No target' : target.kind === 'ship' ? FLEET_SYSTEM_LABELS[weapon.targetId] || 'Hull' : 'Drones'
+                return (
+                  <button key={weapon.instanceId} type="button" role="radio" aria-checked={index === weaponIndex} onClick={() => act((prev) => selectFleetWeapon(prev, index))} className={`flex min-h-[52px] flex-col justify-center rounded-[14px] border-2 bg-panel px-2.5 text-left ${index === weaponIndex ? 'border-accent' : 'border-transparent'}`}>
+                    <span className="truncate text-[14px] font-semibold">{weaponShortName(weapon)}</span>
+                    <span className={`truncate text-[12px] ${blocked ? 'text-fuel' : 'text-mute'}`}>{blocked || `→ ${aimText}`}</span>
+                  </button>
+                )
+              })}
+            </div>
+            {selectedWeapon && weaponTargetEntry?.kind === 'ship' ? (
+              <div className="grid grid-cols-5 gap-1.5" role="radiogroup" aria-label="Enemy system">
+                {FLEET_SYSTEM_IDS.map((systemId) => {
+                  const active = (selectedWeapon.targetId || 'hull') === systemId
+                  return (
+                    <button key={systemId} type="button" role="radio" aria-checked={active} onClick={() => act((prev) => aimFleetWeapon(prev, weaponIndex, weaponTargetEntry.unit.id, systemId))} className={`flex min-h-[60px] flex-col items-center justify-center gap-0.5 rounded-[12px] border-2 px-1 ${active ? 'border-hostile bg-hostile/15' : 'border-transparent bg-panel'}`}>
+                      <Icon name={{ hull: 'ship', weapons: 'target', shields: 'shield', engines: 'engine', crew: 'crew' }[systemId]} size={18} />
+                      <span className="text-[12px] font-semibold">{FLEET_SYSTEM_LABELS[systemId]}</span>
+                      <span className="text-center text-[10px] leading-tight text-mute">{status[systemId]}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            ) : selectedWeapon ? <div className="text-[14px] text-mute">Aimed at their drones. Tap their ship to aim at a system.</div> : null}
+          </>
+        ) : null}
+        {squadronSelected ? (
+          <div className="flex flex-col gap-2">
+            <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Drone target">
+              {enemyUnits.map((unit) => {
+                const active = fleetSquadronTarget(run, selectedEntry.unit) === unit.id
+                return <button key={unit.id} type="button" role="radio" aria-checked={active} onClick={() => act((prev) => aimFleetSquadron(prev, selectedEntry.unit.id, unit.id))} className={`flex min-h-[48px] items-center justify-center rounded-[14px] border-2 px-2 text-[14px] font-semibold ${active ? 'border-hostile bg-hostile/15' : 'border-transparent bg-panel'}`}>{unit.kind === 'ship' ? unit.name : 'Their drones'}</button>
+              })}
+            </div>
+            <div className="text-[13px] text-mute">Drones strike only when they end the move next to their target.</div>
+          </div>
+        ) : null}
+        <PrimaryButton onClick={() => act(resolveFleetRound)}>Execute</PrimaryButton>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mx-auto flex h-[100dvh] w-full max-w-[480px] flex-col overflow-hidden">
+      <div className="flex items-center gap-3 px-4 pt-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline justify-between gap-2"><span className="truncate font-display text-[16px] font-semibold text-hostile-soft">{enemy.name}</span><span className="font-num text-[15px] font-bold">{Math.round(enemy.hull)}/{enemy.hullMax}</span></div>
+          <div className="mt-1.5 flex items-center gap-2">
+            <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-hostile/20"><span className="block h-full rounded-full bg-hostile" style={{ width: `${(enemy.hull / Math.max(1, enemy.hullMax)) * 100}%` }} /></span>
+            {Array.from({ length: enemyLayers }, (_, index) => <span key={index} className={`h-2.5 w-2.5 rounded-full ${index < enemyCharged ? 'bg-hostile-soft' : 'border border-hostile-soft/50'}`} />)}
+          </div>
+        </div>
+        <div className="flex h-9 items-center rounded-[12px] bg-panel px-3 font-num text-[14px] font-bold tracking-[0.08em] text-soft">ROUND {combat.turnNumber}</div>
+        <IconButton icon="more" label="Battle options" onClick={() => setMenuOpen(true)} />
+      </div>
+      <div className="min-h-0 flex-1 px-2 py-1">
+        <FleetArena
+          run={run}
+          now={now}
+          onSelectOwn={(unitId) => act((prev) => selectFleetUnit(prev, unitId))}
+          onTapEnemy={tapEnemy}
+          onPlanShip={(option) => act((prev) => (prev.combat.orders?.[prev.combat.playerShipUnit.id]?.move?.col === option.col && prev.combat.orders?.[prev.combat.playerShipUnit.id]?.move?.row === option.row ? clearFleetMove(prev, prev.combat.playerShipUnit.id) : planFleetShipMove(prev, option)))}
+          onPlanSquadron={(squadronId, hex) => act((prev) => (hexEquals(prev.combat.orders?.[squadronId]?.move, hex) ? clearFleetMove(prev, squadronId) : planFleetSquadronMove(prev, squadronId, hex)))}
+        />
+      </div>
+      <div className="px-4 pb-4 pt-1">{panel}</div>
+      <Sheet open={menuOpen} title="Battle options" subtitle={`${enemy.name} · round ${combat.turnNumber}`} onClose={() => setMenuOpen(false)}>
+        <div className="flex flex-col gap-2">
+          <SecondaryButton disabled={!fleetCombatActive(run)} onClick={() => { setMenuOpen(false); act(offerHexCombatSurrender) }}>Offer tribute to stop the fight</SecondaryButton>
+          <SecondaryButton tone="fuel" disabled={!fleetCombatActive(run) || combat.playerShipUnit.actionsRemaining <= 0} onClick={() => { setMenuOpen(false); act(attemptHexCombatFlee) }}>Flee · {fleeChance}% chance</SecondaryButton>
+          <SecondaryButton disabled={!fleetCombatActive(run)} onClick={() => { setMenuOpen(false); act(autoResolveFleetCombat) }}>Auto-resolve the battle</SecondaryButton>
+          <SecondaryButton onClick={() => { setMenuOpen(false); setLogOpen(true) }}>Battle log</SecondaryButton>
+          <Label className="mt-3">Test tools</Label>
+          <SecondaryButton tone="fuel" onClick={() => act(devRestoreShip)}>Restore ship</SecondaryButton>
+          <SecondaryButton tone="fuel" disabled={Boolean(combat.outcome)} onClick={() => { setMenuOpen(false); act(devForceCombatVictory) }}>Force combat victory</SecondaryButton>
+        </div>
+      </Sheet>
+      <Sheet open={logOpen} title="Battle log" onClose={() => setLogOpen(false)}>
+        <div className="flex flex-col gap-2">{(combat.feed || []).map((entry, index) => <div key={`${entry}_${index}`} className="rounded-[14px] bg-raised px-4 py-3 text-[15px]">{entry}</div>)}</div>
+      </Sheet>
+    </div>
+  )
+}
+
+function ContactScreen({ run, setRun, now }) {
+  const warning = run.combatWarning
+  const enemy = warning.enemy
+  const incomingTribute = tributeDemandCost(run)
+  const canPayIncomingTribute = playerCanPayTribute(run, incomingTribute)
+  const outgoingTributeText = tributeSummary(enemyTributeOffer(run))
+  const canDemandTribute = enemy.kind !== 'patrol' && Boolean(outgoingTributeText)
+  const act = (fn) => setRun((prev) => fn(prev))
+  return (
+    <div className="mx-auto flex min-h-[100dvh] w-full max-w-[480px] flex-col px-4 pb-6 pt-4">
+      <div className="font-num text-[13px] font-semibold uppercase tracking-[0.18em] text-hostile-soft">Contact</div>
+      <h1 className="m-0 mt-1 font-display text-[30px] font-bold leading-tight">{warning.title}</h1>
+      <p className="mb-0 mt-2 text-[17px] leading-relaxed text-[#C2CEDF]">{warning.description}</p>
+      <div className="mt-6 grid grid-cols-2 gap-3">
+        <Card className="p-4"><div className="text-[13px] text-mute">{run.shipName}</div><div className="font-num text-[24px] font-bold">{run.player.hull}<span className="text-[14px] text-mute">/{run.player.hullMax}</span></div><div className="text-[13px] text-soft">{equippedWeapons(run.player).length} weapons · shields {run.player.shields}</div></Card>
+        <Card className="p-4"><div className="text-[13px] text-hostile-soft">{enemy.name}</div><div className="font-num text-[24px] font-bold">{enemy.hull}<span className="text-[14px] text-mute">/{enemy.hullMax}</span></div><div className="text-[13px] text-soft">{(enemy.weapons || []).length} weapons · shields {enemy.shields}</div></Card>
+      </div>
+      <div className="flex-1" />
+      <div className="mt-6 flex flex-col gap-2.5">
+        {(warning.demandChoices || []).map((choice) => {
+          const disabled = choice.id === 'pay_tribute' ? !canPayIncomingTribute : false
+          const note = choice.id === 'pay_tribute' ? `Costs ${tributeSummary(incomingTribute)}${canPayIncomingTribute ? '' : ' (you cannot cover it)'}` : choice.note
+          return <ChoiceButton key={choice.id} title={choice.label} note={note} disabled={disabled} onClick={() => act((prev) => resolveCombatDemand(prev, choice.id))} />
+        })}
+        {canDemandTribute ? <ChoiceButton title="Demand tribute" note={`They pay ${outgoingTributeText} if they back down`} onClick={() => act(demandTributeFromEnemy)} /> : null}
+        <div className="flex gap-2.5">
+          <SecondaryButton className="h-[60px] flex-1 rounded-[18px]" tone="fuel" onClick={() => act(fleeCombatWarning)}>Flee · {Math.round((warning.escapeChance || 0) * 100)}%</SecondaryButton>
+          <PrimaryButton className="flex-1" tone="hostile" onClick={() => act(engageCombatWarning)}>Engage</PrimaryButton>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EndScreen({ kind, run, onNewRun, onMenu }) {
+  const won = kind === 'victory'
+  return (
+    <div className="mx-auto flex min-h-[100dvh] w-full max-w-[480px] flex-col items-center justify-center px-6 text-center">
+      <div className={`font-num text-[14px] font-semibold uppercase tracking-[0.2em] ${won ? 'text-exit' : 'text-hostile-soft'}`}>{won ? 'Run complete' : 'Run lost'}</div>
+      <h1 className="m-0 mt-2 font-display text-[36px] font-bold">{won ? 'Ten systems crossed' : `${run.shipName} is gone`}</h1>
+      <p className="text-[17px] text-soft">{won ? `${run.shipName} reached the end of the line in ${run.turn} turns.` : `Lost in system ${run.systemIndex} of ${MASTER.maxSystems}, turn ${run.turn}.`}</p>
+      <PrimaryButton className="mt-6 w-full" onClick={onNewRun}>New run</PrimaryButton>
+      {onMenu ? <button type="button" onClick={onMenu} className="mt-2 h-11 text-[15px] font-semibold text-mute">Back to start</button> : null}
+    </div>
+  )
+}
+
+const HULL_TAGLINES = {
+  Scout: 'Fast, quiet, fragile',
+  Cargo: 'Deep holds, slow turns',
+  Battleship: 'Heavy hull, loud signature',
+}
+
+function LaunchScreen({ setup, setSetup, onStart, onContinue, hasSave }) {
+  const [editingNames, setEditingNames] = useState(false)
+  const classes = Object.keys(SHIP_PRESETS)
+  const index = Math.max(0, classes.indexOf(setup.shipClass))
+  const preset = SHIP_PRESETS[classes[index]]
+  const pickClass = (shipClass) => setSetup((prev) => {
+    const nextDefaultName = SHIP_NAME_DEFAULTS[shipClass] || shipClass
+    const previousDefaultName = SHIP_NAME_DEFAULTS[prev.shipClass] || prev.shipClass
+    const keepCustomName = String(prev.shipName || '').trim() && sanitizeName(prev.shipName, previousDefaultName) !== previousDefaultName
+    return sanitizeSetupPrefs({ ...prev, shipClass, shipName: keepCustomName ? prev.shipName : nextDefaultName })
+  })
+  const step = (delta) => pickClass(classes[(index + delta + classes.length) % classes.length])
+  const shipName = sanitizeName(setup.shipName, SHIP_NAME_DEFAULTS[setup.shipClass] || setup.shipClass)
+  const aiName = sanitizeName(setup.playerName, DEFAULT_PLAYER_NAME)
+  return (
+    <div className="mx-auto flex min-h-[100dvh] w-full max-w-[480px] flex-col px-5 pb-6 pt-4">
+      <div className="font-display text-[26px] font-bold tracking-[0.14em]">STL</div>
+      <div className="mt-12 text-center">
+        <h1 className="m-0 font-display text-[40px] font-bold uppercase tracking-[0.12em]">{classes[index]}</h1>
+        <div className="mt-1 text-[16px] text-soft">{HULL_TAGLINES[classes[index]]}</div>
+      </div>
+      <div className="relative mt-6 flex h-[200px] items-center justify-between">
+        <button type="button" aria-label="Previous hull" onClick={() => step(-1)} className="relative z-10 flex h-12 w-12 items-center justify-center rounded-full bg-panel"><Icon name="left" /></button>
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <svg width="300" height="70" viewBox="0 0 300 70" className="absolute bottom-2" aria-hidden="true"><ellipse cx="150" cy="35" rx="120" ry="20" fill="#46E0FF" fillOpacity="0.07" stroke="#46E0FF" strokeOpacity="0.35" /></svg>
+          <ShipSilhouette shipClass={classes[index]} width={240} />
+        </div>
+        <button type="button" aria-label="Next hull" onClick={() => step(1)} className="relative z-10 flex h-12 w-12 items-center justify-center rounded-full bg-panel"><Icon name="right" /></button>
+      </div>
+      <div className="mt-2 flex justify-center gap-2" aria-hidden="true">
+        {classes.map((shipClass, dotIndex) => <span key={shipClass} className={`h-1.5 rounded-full ${dotIndex === index ? 'w-6 bg-accent' : 'w-1.5 bg-ink/25'}`} />)}
+      </div>
+      <div className="mt-8 grid grid-cols-3 text-center">
+        {[['Hull', preset.hullMax], ['Speed', preset.speed], ['Cargo', preset.cargoCapacity]].map(([label, value]) => (
+          <div key={label} className="flex flex-col"><span className="font-num text-[30px] font-bold">{value}</span><span className="text-[13px] text-mute">{label}</span></div>
+        ))}
+      </div>
+      <div className="flex-1" />
+      {editingNames ? (
+        <div className="mb-3 grid grid-cols-2 gap-3">
+          <label className="flex flex-col gap-1 text-[13px] text-mute">Ship name
+            <input className="h-12 rounded-[14px] bg-panel px-3 text-[16px] text-ink outline-none focus:ring-2 focus:ring-accent" value={setup.shipName} maxLength={24} onChange={(event) => setSetup((prev) => ({ ...prev, shipName: event.target.value }))} />
+          </label>
+          <label className="flex flex-col gap-1 text-[13px] text-mute">AI name
+            <input className="h-12 rounded-[14px] bg-panel px-3 text-[16px] text-ink outline-none focus:ring-2 focus:ring-accent" value={setup.playerName} maxLength={24} onChange={(event) => setSetup((prev) => ({ ...prev, playerName: event.target.value }))} />
+          </label>
+        </div>
+      ) : (
+        <button type="button" onClick={() => setEditingNames(true)} className="mx-auto mb-2 flex h-11 items-center gap-2 rounded-[14px] px-4 text-[15px] text-soft">{shipName} · AI {aiName}<Icon name="pencil" size={16} /></button>
+      )}
+      <PrimaryButton onClick={onStart}>Launch</PrimaryButton>
+      {hasSave ? <button type="button" onClick={onContinue} className="mt-2 h-11 rounded-[14px] text-[15px] font-semibold text-mute">Continue saved run</button> : null}
+    </div>
+  )
+}
+
 export default function STLSynthesisedGame() {
   const [run, setRun] = useState(null)
   const [setup, setSetup] = useState(defaultSetupPrefs())
   const [now, setNow] = useState(Date.now())
   const [hoveredCombatUnitId, setHoveredCombatUnitId] = useState(null)
   const mapFrameRef = useRef(null)
+  const [toast, setToast] = useState(null)
+  const lastLogKeyRef = useRef(null)
   const mapGestureRef = useRef({ mode: null, moved: false, startScale: 1, startCenter: { x: 180, y: 180 }, startTouch: { x: 0, y: 0 }, startDistance: 0, startMidpoint: { x: 0, y: 0 } })
 
   useEffect(() => {
@@ -6239,6 +7844,21 @@ export default function STLSynthesisedGame() {
       localStorage.removeItem(MASTER.saveKey)
     }
   }, [])
+
+  useEffect(() => {
+    const head = run?.log?.[0]
+    const key = head ? `${run.log.length}|${head}` : null
+    if (!key) return undefined
+    if (lastLogKeyRef.current === null || run.screen !== 'map') {
+      lastLogKeyRef.current = key
+      return undefined
+    }
+    if (key === lastLogKeyRef.current) return undefined
+    lastLogKeyRef.current = key
+    setToast(rawLogText(head))
+    const id = window.setTimeout(() => setToast(null), 3200)
+    return () => window.clearTimeout(id)
+  }, [run?.log?.length, run?.log?.[0], run?.screen])
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 33)
@@ -6323,7 +7943,7 @@ export default function STLSynthesisedGame() {
   }
 
   const handleMapTouchStart = (event) => {
-    if (!run || run.ui.mainTerminal !== 'system' || run.ui.travelAnimation || run.pendingEvent) return
+    if (!run || run.ui.view !== 'map' || run.ui.travelAnimation || run.pendingEvent) return
     const gesture = mapGestureRef.current
     gesture.moved = false
     gesture.startScale = run.ui.mapScale
@@ -6339,7 +7959,7 @@ export default function STLSynthesisedGame() {
   }
 
   const handleMapTouchMove = (event) => {
-    if (!run || run.ui.mainTerminal !== 'system' || run.ui.travelAnimation || run.pendingEvent) return
+    if (!run || run.ui.view !== 'map' || run.ui.travelAnimation || run.pendingEvent) return
     const frame = mapFrameRef.current
     if (!frame) return
     const rect = frame.getBoundingClientRect()
@@ -6370,7 +7990,7 @@ export default function STLSynthesisedGame() {
   }
 
   const handleMapTouchEnd = (event) => {
-    if (!run || run.ui.mainTerminal !== 'system' || run.ui.travelAnimation || run.pendingEvent) return
+    if (!run || run.ui.view !== 'map' || run.ui.travelAnimation || run.pendingEvent) return
     const gesture = mapGestureRef.current
     if (event.touches.length === 0) {
       gesture.mode = null
@@ -6393,7 +8013,7 @@ export default function STLSynthesisedGame() {
   }
 
   const handleMapMouseDown = (event) => {
-    if (!run || run.ui.mainTerminal !== 'system' || run.ui.travelAnimation || run.pendingEvent) return
+    if (!run || run.ui.view !== 'map' || run.ui.travelAnimation || run.pendingEvent) return
     if (event.button !== 0) return
     const gesture = mapGestureRef.current
     gesture.mode = 'mouse-pan'
@@ -6419,6 +8039,11 @@ export default function STLSynthesisedGame() {
     if (mapGestureRef.current.mode === 'mouse-pan') mapGestureRef.current.mode = null
   }
 
+  const handleMapWheel = (event) => {
+    if (!run || run.ui.view !== 'map' || run.ui.travelAnimation) return
+    setRun((prev) => zoomMap(prev, event.deltaY < 0 ? 0.25 : -0.25))
+  }
+
   const handleMapClick = () => {
     const gesture = mapGestureRef.current
     if (gesture.moved) {
@@ -6427,7 +8052,6 @@ export default function STLSynthesisedGame() {
     }
   }
 
-  const selectedSetupPreset = SHIP_PRESETS[setup.shipClass] || SHIP_PRESETS.Scout
   const startConfiguredRun = () => {
     const nextSetup = sanitizeSetupPrefs(setup)
     setSetup(nextSetup)
@@ -6439,485 +8063,41 @@ export default function STLSynthesisedGame() {
     setRun(newRun(nextSetup))
   }
 
+  const loadSavedRun = () => {
+    try {
+      const saved = localStorage.getItem(MASTER.saveKey)
+      if (!saved) return
+      const restored = normalizeRun(JSON.parse(saved))
+      if (restored) {
+        setRun(restored)
+        setSetup(setupFromRun(restored))
+      }
+      else localStorage.removeItem(MASTER.saveKey)
+    } catch {
+      localStorage.removeItem(MASTER.saveKey)
+    }
+  }
+
   if (!run) {
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 p-4 flex items-center justify-center">
-        <div className="w-full max-w-3xl rounded-3xl border border-cyan-700 bg-slate-900 p-5 shadow-2xl">
-          <div className="text-xs uppercase tracking-[0.28em] text-cyan-300">STL v2</div>
-          <h1 className="mt-2 text-3xl font-bold">Sublight strategy run</h1>
-          <div className="mt-2 text-sm text-slate-400">Choose a ship, confirm its name, and set the onboard AI name before launch.</div>
-          <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(0,1.2fr)_320px]">
-            <div className="grid gap-4">
-              <div className="grid gap-3 sm:grid-cols-3">
-                {Object.entries(SHIP_PRESETS).map(([shipClass, preset]) => (
-                  <button
-                    key={shipClass}
-                    className={`rounded-3xl border p-4 text-left ${setup.shipClass === shipClass ? 'border-cyan-500 bg-cyan-950/20' : 'border-slate-800 bg-slate-950/45'}`}
-                    onClick={() => setSetup((prev) => {
-                      const nextDefaultName = SHIP_NAME_DEFAULTS[shipClass] || shipClass
-                      const previousDefaultName = SHIP_NAME_DEFAULTS[prev.shipClass] || prev.shipClass
-                      const shouldReplaceShipName = !String(prev.shipName || '').trim() || sanitizeName(prev.shipName, previousDefaultName) === previousDefaultName
-                      return sanitizeSetupPrefs({
-                        ...prev,
-                        shipClass,
-                        shipName: shouldReplaceShipName ? nextDefaultName : prev.shipName,
-                      })
-                    })}
-                    type="button"
-                  >
-                    <div className="text-lg font-semibold">{shipClass}</div>
-                    <div className="mt-1 text-xs text-slate-400">{preset.hullMax} hull · {preset.shieldsMax} shields · {preset.weaponSlots} slots · {preset.value} credits</div>
-                    <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-slate-300">
-                      <div>Fuel {preset.fuelCapacity}</div>
-                      <div>Cargo {preset.cargoCapacity}</div>
-                      <div>Crew {preset.crewCapacity}</div>
-                      <div>Power {preset.maxPower}</div>
-                    </div>
-                  </button>
-                ))}
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <label className="grid gap-2">
-                  <span className="text-xs uppercase tracking-[0.2em] text-slate-400">Ship name</span>
-                  <input
-                    className="rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none focus:border-cyan-500"
-                    value={setup.shipName}
-                    maxLength={24}
-                    onChange={(event) => setSetup((prev) => ({ ...prev, shipName: event.target.value }))}
-                  />
-                </label>
-                <label className="grid gap-2">
-                  <span className="text-xs uppercase tracking-[0.2em] text-slate-400">AI name</span>
-                  <input
-                    className="rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none focus:border-cyan-500"
-                    value={setup.playerName}
-                    maxLength={24}
-                    onChange={(event) => setSetup((prev) => ({ ...prev, playerName: event.target.value }))}
-                  />
-                </label>
-              </div>
-            </div>
-            <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-4">
-              <div className="text-xs uppercase tracking-[0.22em] text-slate-400">Launch preview</div>
-              <div className="mt-2 text-xl font-semibold">{sanitizeName(setup.shipName, SHIP_NAME_DEFAULTS[setup.shipClass] || setup.shipClass)}</div>
-              <div className="text-sm text-cyan-200">{sanitizeName(setup.playerName, DEFAULT_PLAYER_NAME)} · {setup.shipClass}</div>
-              <div className="mt-4 grid grid-cols-2 gap-2">
-                <MiniStat label="Hull" value={selectedSetupPreset.hullMax} tone="green" />
-                <MiniStat label="Shields" value={selectedSetupPreset.shieldsMax} tone="cyan" />
-                <MiniStat label="Cargo" value={selectedSetupPreset.cargoCapacity} tone="amber" />
-                <MiniStat label="Fuel" value={selectedSetupPreset.fuelCapacity} tone="amber" />
-                <MiniStat label="Crew" value={selectedSetupPreset.crewCapacity} tone="cyan" />
-                <MiniStat label="Stealth" value={selectedSetupPreset.stealth} tone="green" />
-                <MiniStat label="Power" value={selectedSetupPreset.maxPower} tone="amber" />
-                <MiniStat label="Weapon slots" value={selectedSetupPreset.weaponSlots} tone="cyan" />
-                <MiniStat label="Value" value={`${selectedSetupPreset.value} cr`} tone="amber" />
-              </div>
-              <div className="mt-5 grid gap-3">
-                <ActionButton tone="green" onClick={startConfiguredRun}>Start new run</ActionButton>
-              </div>
-            </div>
-          </div>
-          <div className="mt-5 grid gap-3 max-w-sm">
-            <ActionButton onClick={() => {
-              try {
-                const saved = localStorage.getItem(MASTER.saveKey)
-                if (!saved) return
-                const restored = normalizeRun(JSON.parse(saved))
-                if (restored) {
-                  setRun(restored)
-                  setSetup(setupFromRun(restored))
-                }
-                else localStorage.removeItem(MASTER.saveKey)
-              } catch {
-                localStorage.removeItem(MASTER.saveKey)
-              }
-            }}>Load local save</ActionButton>
-          </div>
-        </div>
-      </div>
-    )
+    let hasSave = false
+    try {
+      hasSave = Boolean(localStorage.getItem(MASTER.saveKey))
+    } catch {
+      hasSave = false
+    }
+    return <LaunchScreen setup={setup} setSetup={setSetup} onStart={startConfiguredRun} onContinue={loadSavedRun} hasSave={hasSave} />
   }
 
-  if (run.screen === 'victory') {
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 p-4 flex items-center justify-center">
-        <div className="w-full max-w-md rounded-3xl border border-emerald-800 bg-emerald-950/20 p-5">
-          <div className="text-xs uppercase tracking-[0.28em] text-emerald-300">Victory</div>
-          <h1 className="mt-2 text-3xl font-bold">Run completed</h1>
-          <div className="mt-5 grid gap-3">
-            <ActionButton tone="green" onClick={() => { localStorage.removeItem(MASTER.saveKey); setRun(null) }}>Start new run</ActionButton>
-            <ActionButton onClick={() => setRun(null)}>Return to menu</ActionButton>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  if (run.screen === 'gameover') {
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 p-4 flex items-center justify-center">
-        <div className="w-full max-w-md rounded-3xl border border-rose-800 bg-rose-950/20 p-5">
-          <div className="text-xs uppercase tracking-[0.28em] text-rose-300">Game over</div>
-          <h1 className="mt-2 text-3xl font-bold">Run lost</h1>
-          <div className="mt-5 grid gap-3">
-            <ActionButton tone="green" onClick={() => { localStorage.removeItem(MASTER.saveKey); setRun(null) }}>Start new run</ActionButton>
-            <ActionButton tone="rose" onClick={() => { localStorage.removeItem(MASTER.saveKey); setRun(null) }}>Discard save</ActionButton>
-          </div>
-        </div>
-      </div>
-    )
+  if (run.screen === 'victory' || run.screen === 'gameover') {
+    return <EndScreen kind={run.screen} run={run} onNewRun={() => { try { localStorage.removeItem(MASTER.saveKey) } catch { /* storage unavailable */ } setRun(null) }} onMenu={run.screen === 'victory' ? () => setRun(null) : null} />
   }
 
   if (run.screen === 'combat_warning' && run.combatWarning) {
-    const warningEnemy = run.combatWarning.enemy
-    const incomingTribute = tributeDemandCost(run)
-    const canPayIncomingTribute = playerCanPayTribute(run, incomingTribute)
-    const outgoingTribute = enemyTributeOffer(run)
-    const outgoingTributeText = tributeSummary(outgoingTribute)
-    const canDemandTribute = warningEnemy.kind !== 'patrol' && Boolean(outgoingTributeText)
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
-        <RunMenu run={run} setRun={setRun} />
-        <div className="mx-auto w-full max-w-6xl">
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1.2fr)_360px]">
-            <div className="rounded-3xl border border-amber-700 bg-slate-900 p-4 shadow-2xl">
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <div className="text-xs uppercase tracking-[0.24em] text-amber-300">Combat warning</div>
-                  <div className="mt-1 text-2xl font-bold">{run.combatWarning.title}</div>
-                  <div className="mt-2 text-sm text-slate-300">{run.combatWarning.description}</div>
-                </div>
-                <div className="rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3 text-right">
-                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Estimated flee chance</div>
-                  <div className="mt-1 text-2xl font-bold text-cyan-200">{Math.round((run.combatWarning.escapeChance || 0) * 100)}%</div>
-                </div>
-              </div>
-              <div className="mt-4">
-                <CombatScene player={run.player} enemy={warningEnemy} shots={[]} now={now} playerLabel={run.shipName} />
-              </div>
-              <div className="mt-4 grid gap-3 xl:grid-cols-2">
-                <EntityStatusPanel title={run.shipName} entity={run.player} systems={{ shieldLayersDisabled: 0, engineDamage: 0 }} accent="cyan" stats={[{ label: 'Speed', value: playerSpeedValue(run), tone: 'green' }, { label: 'Dodge', value: `${Math.round(dodgeChance(run.player.maneuverability + pilotManeuverBonus(run)) * 100)}%`, tone: 'cyan' }, { label: 'Stealth', value: playerStealthValue(run), tone: 'green' }, { label: 'Weapons', value: `${equippedWeapons(run.player).length} / ${run.player.weaponSlotsMax}`, tone: 'amber' }]} />
-                <EntityStatusPanel title={warningEnemy.name} entity={warningEnemy} systems={{ shieldLayersDisabled: 0, engineDamage: 0 }} accent="rose" stats={[{ label: 'Speed', value: warningEnemy.speed, tone: 'rose' }, { label: 'Dodge', value: `${Math.round(dodgeChance(warningEnemy.maneuverability) * 100)}%`, tone: 'rose' }, { label: 'Stealth', value: warningEnemy.stealth, tone: 'amber' }, { label: 'Weapons', value: warningEnemy.weapons.length, tone: 'amber' }]} />
-              </div>
-            </div>
-            <div className="grid grid-cols-1 content-start gap-3">
-              <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-4">
-                <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Loadouts</div>
-                <div className="mt-3 grid gap-3">
-                  <div className="rounded-2xl border border-cyan-800 bg-cyan-950/10 p-3">
-                    <div className="text-xs uppercase tracking-[0.18em] text-cyan-300">{run.shipName}</div>
-                    <div className="mt-3 grid gap-2">
-                      {run.player.weaponSlots.map((weapon, index) => weapon ? <div key={weapon.instanceId} className="rounded-2xl border border-cyan-900/60 bg-slate-950/45 px-3 py-3"><div className="flex items-center justify-between gap-3"><div><div className="text-sm font-semibold">#{index + 1} {weapon.name}</div><div className="text-xs text-slate-400">Mount {index + 1} · HP {Math.round(weapon.hp || 0)}/{weapon.maxHp}</div></div><div className="text-xs text-slate-400">{weapon.ammoType ? `${weaponAmmoCount(run, weapon, true)} ${ammoUnitsLabel(weapon.ammoType)}` : 'No ammo'}</div></div><div className="mt-2 h-2 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(weapon) * 100}%` }} /></div></div> : null)}
-                    </div>
-                  </div>
-                  <div className="rounded-2xl border border-rose-800 bg-rose-950/10 p-3">
-                    <div className="text-xs uppercase tracking-[0.18em] text-rose-300">{warningEnemy.name}</div>
-                    <div className="mt-3 grid gap-2">
-                      {warningEnemy.weapons.map((weapon, index) => <div key={weapon.instanceId} className="rounded-2xl border border-rose-900/60 bg-slate-950/45 px-3 py-3"><div className="flex items-center justify-between gap-3"><div><div className="text-sm font-semibold">#{index + 1} {weapon.name}</div><div className="text-xs text-slate-400">HP {Math.round(weapon.hp || 0)}/{weapon.maxHp}</div></div><div className="text-xs text-slate-400">{weapon.ammoType ? `${weaponAmmoCount(run, weapon, false)} ${ammoUnitsLabel(weapon.ammoType)}` : 'No ammo'}</div></div><div className="mt-2 h-2 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(weapon) * 100}%` }} /></div></div>)}
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-4">
-                {Array.isArray(run.combatWarning.demandChoices) && run.combatWarning.demandChoices.length > 0 ? <div className="mb-4 rounded-2xl border border-amber-800 bg-amber-950/20 p-3"><div className="text-xs uppercase tracking-[0.18em] text-amber-300">Demands</div><div className="mt-3 grid gap-2">{run.combatWarning.demandChoices.map((choice) => {
-                  const dynamicNote = choice.id === 'pay_tribute'
-                    ? `You pay ${tributeSummary(incomingTribute)} to the opposing ship. ${canPayIncomingTribute ? 'Payment is possible.' : 'You cannot cover this demand.'}`
-                    : choice.id === 'allow_inspection'
-                      ? 'You allow the police ship to inspect your cargo, crew, and warrants.'
-                      : choice.note
-                  const disabled = choice.id === 'pay_tribute' ? !canPayIncomingTribute : false
-                  return <div key={choice.id} className="rounded-2xl border border-amber-900/60 bg-slate-950/45 p-3"><div className="text-sm font-semibold text-slate-100">{choice.label}</div><div className="mt-1 text-xs text-slate-400">{dynamicNote}</div><div className="mt-3"><ActionButton tone="amber" disabled={disabled} onClick={() => setRun((prev) => resolveCombatDemand(prev, choice.id))}>{choice.label}</ActionButton></div></div>
-                })}</div></div> : null}
-                <div className="grid gap-3">
-                  {canDemandTribute ? <ActionButton tone="green" onClick={() => setRun((prev) => demandTributeFromEnemy(prev))}>Demand tribute: enemy pays {outgoingTributeText}</ActionButton> : null}
-                  <ActionButton tone="rose" onClick={() => setRun((prev) => engageCombatWarning(prev))}>Engage</ActionButton>
-                  <ActionButton tone="green" onClick={() => setRun((prev) => fleeCombatWarning(prev))}>Flee</ActionButton>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
+    return <ContactScreen run={run} setRun={setRun} now={now} />
   }
 
   if (run.screen === 'combat_hex' && run.combat) {
-    const playerUnits = combatUnitSummaries(run, 'player')
-    const enemyUnits = combatUnitSummaries(run, 'enemy')
-    const playerHangarUnits = combatHangarSummaries(run, 'player')
-    const enemyHangarUnits = combatHangarSummaries(run, 'enemy')
-    const selectedUnit = run.combat.selectedUnitId ? combatUnitSummary(run, run.combat.selectedUnitId) : null
-    const selectedWeaponIndex = Number.isInteger(run.ui.selectedCombatWeaponIndex) ? run.ui.selectedCombatWeaponIndex : null
-    const selectedWeaponSide = run.ui.selectedCombatWeaponSide === 'enemy' ? 'enemy' : 'player'
-    const playerWeaponEntries = run.player.weaponSlots.map((weapon, index) => weapon ? { weapon, index } : null).filter(Boolean)
-    const enemyWeaponEntries = run.combat.enemy.weapons.map((weapon, index) => weapon ? { weapon, index } : null).filter(Boolean)
-    const selectedShipWeapon = selectedUnit?.kind === 'ship' && selectedWeaponIndex !== null && selectedWeaponSide === selectedUnit.side
-      ? ((selectedUnit.side === 'player' ? run.player.weaponSlots?.[selectedWeaponIndex] : run.combat.enemy.weapons?.[selectedWeaponIndex]) || null)
-      : null
-    const selectedShipWeaponOwner = selectedShipWeapon ? (selectedWeaponSide === 'player' ? run.shipName : run.combat.enemy.name) : null
-    const selectedTarget = selectedShipWeapon
-      ? combatUnitSummary(run, selectedHexWeaponTargetId(run, selectedShipWeapon, selectedWeaponSide))
-      : (combatUnitSummary(run, run.combat.selectedTargetUnitId) || enemyUnits[0] || null)
-    const selectedAttackPreview = selectedUnit?.side === 'player' && selectedTarget
-      ? hexCombatAttackPreview(run, selectedUnit.id, selectedTarget.id)
-      : { canAttack: false, reason: 'Select a player unit' }
-    const selectedMoveHexes = selectedUnit?.side === 'player' ? hexCombatReachableHexes(run, selectedUnit.id) : []
-    const selectedSquadronCanAttack = selectedUnit?.kind === 'squadron' && selectedAttackPreview.canAttack
-    const selectedShieldTotal = selectedUnit ? (selectedUnit.kind === 'ship' ? shieldLayerCount({ shieldsMax: selectedUnit.shieldsMax, shields: selectedUnit.shields }) : Math.max(0, selectedUnit.shieldsMax || 0)) : 0
-    const selectedShieldFilled = selectedUnit ? (selectedUnit.kind === 'ship' ? chargedShieldLayers({ shieldsMax: selectedUnit.shieldsMax, shields: selectedUnit.shields }) : Math.max(0, selectedUnit.shields || 0)) : 0
-    const negotiation = run.combat.negotiation
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
-        <RunMenu run={run} setRun={setRun} />
-        <div className="mx-auto w-full max-w-7xl">
-          <div className="rounded-3xl border border-amber-700 bg-slate-900 p-3 shadow-2xl">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <div className="text-xs uppercase tracking-[0.25em] text-amber-300">Tactical view</div>
-                <div className="mt-1 text-xl font-bold">{run.shipName} vs {run.combat.enemy.name}</div>
-                <div className="text-xs text-slate-400">Turn {run.combat.turnNumber}</div>
-              </div>
-            </div>
-
-            <div className="mt-3 grid gap-3 lg:grid-cols-[200px_minmax(0,1fr)_200px]">
-              <div className="rounded-2xl border border-cyan-800 bg-cyan-950/10 p-2.5">
-                <div className="text-sm font-semibold text-cyan-100">{run.shipName}</div>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${(run.player.hull / Math.max(1, run.player.hullMax)) * 100}%` }} /></div>
-                <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-slate-400">
-                  <span>SPD {playerSpeedValue(run)}</span>
-                  <span>DDG {Math.round(dodgeChance(run.player.maneuverability + pilotManeuverBonus(run)) * 100)}%</span>
-                  <span>STL {playerStealthValue(run)}</span>
-                </div>
-                <div className="mt-2 grid gap-2">
-                  <LayerPips label="Sh" total={shieldLayerCount({ shieldsMax: run.player.shieldsMax, shields: run.player.shields })} filled={chargedShieldLayers({ shieldsMax: run.player.shieldsMax, shields: run.player.shields })} activeColour="#3b82f6" />
-                  <LayerPips label="Ar" total={Math.max(0, run.player.armourMax || run.player.armour)} filled={Math.max(0, run.player.armour || 0)} activeColour="#f8fafc" />
-                </div>
-                <div className="mt-2 grid gap-2">
-                  {playerWeaponEntries.map(({ weapon, index }) => {
-                    const isSelected = selectedWeaponSide === 'player' && selectedWeaponIndex === index
-                    return (
-                      <button key={weapon.instanceId} type="button" className={`rounded-xl border px-2 py-1.5 text-left ${isSelected ? 'border-amber-500 bg-amber-950/20' : 'border-cyan-900/70 bg-slate-950/55'}`} onClick={() => setRun((prev) => selectHexCombatWeapon(prev, 'player', index))}>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-[11px] font-semibold text-slate-100">#{index + 1} {compactCombatWeaponLabel(weapon)}</span>
-                          <span className="text-[10px] text-slate-400">{weapon.ammoType ? weaponAmmoCount(run, weapon, true) : '∞'}</span>
-                        </div>
-                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(weapon) * 100}%` }} /></div>
-                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-cyan-400" style={{ width: `${hexWeaponReadinessRatio(weapon) * 100}%` }} /></div>
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-
-              <HexCombatArena
-                run={run}
-                onHexClick={(hex) => setRun((prev) => moveSelectedHexCombatUnit(prev, hex))}
-                onSelectUnit={(unitId) => setRun((prev) => selectHexCombatUnit(prev, unitId))}
-                onTargetUnit={(unitId) => setRun((prev) => setHexCombatTargetUnit(prev, unitId))}
-                onAttackUnit={(unitId) => setRun((prev) => attackSelectedHexCombatTarget(prev, unitId))}
-                onHoverUnit={setHoveredCombatUnitId}
-                hoveredUnitId={hoveredCombatUnitId}
-                now={now}
-              />
-
-              <div className="rounded-2xl border border-rose-800 bg-rose-950/10 p-2.5">
-                <div className="text-sm font-semibold text-rose-100">{run.combat.enemy.name}</div>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${(run.combat.enemy.hull / Math.max(1, run.combat.enemy.hullMax)) * 100}%` }} /></div>
-                <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-slate-400">
-                  <span>SPD {run.combat.enemy.speed}</span>
-                  <span>DDG {Math.round(dodgeChance(run.combat.enemy.maneuverability) * 100)}%</span>
-                  <span>STL {run.combat.enemy.stealth}</span>
-                </div>
-                <div className="mt-2 grid gap-2">
-                  <LayerPips label="Sh" total={shieldLayerCount({ shieldsMax: run.combat.enemy.shieldsMax, shields: run.combat.enemy.shields })} filled={chargedShieldLayers({ shieldsMax: run.combat.enemy.shieldsMax, shields: run.combat.enemy.shields })} activeColour="#3b82f6" />
-                  <LayerPips label="Ar" total={Math.max(0, run.combat.enemy.armourMax || run.combat.enemy.armour)} filled={Math.max(0, run.combat.enemy.armour || 0)} activeColour="#f8fafc" />
-                </div>
-                <div className="mt-2 grid gap-2">
-                  {enemyWeaponEntries.map(({ weapon, index }) => {
-                    const isSelected = selectedWeaponSide === 'enemy' && selectedWeaponIndex === index
-                    return (
-                      <button key={weapon.instanceId} type="button" className={`rounded-xl border px-2 py-1.5 text-left ${isSelected ? 'border-amber-500 bg-amber-950/20' : 'border-rose-900/70 bg-slate-950/55'}`} onClick={() => setRun((prev) => selectHexCombatWeapon(prev, 'enemy', index))}>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-[11px] font-semibold text-slate-100">#{index + 1} {compactCombatWeaponLabel(weapon)}</span>
-                          <span className="text-[10px] text-slate-400">{weapon.ammoType ? weaponAmmoCount(run, weapon, false) : '∞'}</span>
-                        </div>
-                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(weapon) * 100}%` }} /></div>
-                        <div className="mt-1 h-1.5 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-cyan-400" style={{ width: `${hexWeaponReadinessRatio(weapon) * 100}%` }} /></div>
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-3 rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
-            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Active units</div>
-            <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_150px_minmax(0,1fr)]">
-              <TacticalSquadView title="Player" units={playerUnits} accent="cyan" selectedUnitId={run.combat.selectedUnitId} hoveredUnitId={hoveredCombatUnitId} onSelect={(unitId) => setRun((prev) => selectHexCombatUnit(prev, unitId))} onHover={setHoveredCombatUnitId} emptyLabel="No player units." />
-              <div className="flex flex-col items-center justify-center gap-2">
-                {run.combat.outcome ? <ActionButton tone="green" onClick={() => setRun((prev) => continueAfterCombat(prev))}>Continue</ActionButton> : <ActionButton tone="amber" onClick={() => setRun((prev) => resolveHexCombatTurn(prev))}>End turn</ActionButton>}
-                {!run.combat.outcome ? (
-                  <div className="flex flex-wrap items-center justify-center gap-2">
-                    <MiniActionButton disabled={Boolean(run.combat.negotiation)} onClick={() => setRun((prev) => autoResolveHexCombat(prev))}>auto-resolve</MiniActionButton>
-                    <MiniActionButton active={Boolean(run.combat.autoCombat)} disabled={Boolean(run.combat.negotiation && run.combat.negotiation.side !== 'enemy')} onClick={() => setRun((prev) => toggleHexCombatAutoCombat(prev))}>auto-combat</MiniActionButton>
-                  </div>
-                ) : null}
-              </div>
-              <TacticalSquadView title="Enemy" units={enemyUnits} accent="rose" selectedUnitId={run.combat.selectedUnitId} hoveredUnitId={hoveredCombatUnitId} onSelect={(unitId) => setRun((prev) => selectHexCombatUnit(prev, unitId))} onHover={setHoveredCombatUnitId} emptyLabel="No enemy units." />
-            </div>
-          </div>
-
-          <div className="mt-3 rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
-            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Hangar view</div>
-            <div className="mt-3 grid gap-3 lg:grid-cols-2">
-              <TacticalHangarView title="Player" units={playerHangarUnits} onDeploy={() => setRun((prev) => launchHexCombatSquadron(prev))} />
-              <TacticalHangarView title="Enemy" units={enemyHangarUnits} onDeploy={() => {}} />
-            </div>
-          </div>
-
-          <div className="mt-3 rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
-            <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Unit view</div>
-            {selectedUnit ? (
-              <div className="mt-3">
-                {selectedUnit.kind === 'ship' ? (
-                  selectedShipWeapon ? (
-                    <div className="rounded-2xl border border-slate-800 bg-slate-950/45 p-2.5">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-semibold">#{selectedWeaponIndex + 1} {selectedShipWeapon.name}</div>
-                          <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{selectedShipWeaponOwner} · {selectedWeaponSide === 'player' ? 'Player weapon' : 'Enemy weapon'}</div>
-                        </div>
-                        <div className="text-xs text-slate-400">{selectedShipWeapon.ammoType ? `${selectedWeaponSide === 'player' ? weaponAmmoCount(run, selectedShipWeapon, true) : weaponAmmoCount(run, selectedShipWeapon, false)} ${ammoUnitsLabel(selectedShipWeapon.ammoType)}` : 'No ammo required'}</div>
-                      </div>
-                      <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
-                        <MiniStat label="Damage" value={selectedShipWeapon.damage} tone="amber" />
-                        <MiniStat label="Accuracy" value={`${Math.round((selectedShipWeapon.accuracy || 0) * 100)}%`} tone="cyan" />
-                        <MiniStat label="Target" value={selectedTarget?.name || 'None'} tone="amber" />
-                        <MiniStat label="Readiness" value={selectedShipWeapon.hexReadyIn > 0 ? `${selectedShipWeapon.hexReadyIn} turn(s)` : 'Ready'} tone={selectedShipWeapon.hexReadyIn > 0 ? 'slate' : 'green'} />
-                        <MiniStat label="Ammo" value={selectedShipWeapon.ammoType ? (selectedWeaponSide === 'player' ? weaponAmmoCount(run, selectedShipWeapon, true) : weaponAmmoCount(run, selectedShipWeapon, false)) : '∞'} tone="amber" />
-                      </div>
-                      <div className="mt-3 h-2 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(selectedShipWeapon) * 100}%` }} /></div>
-                      <div className="mt-2 h-2 overflow-hidden rounded-full border border-slate-700 bg-slate-950"><div className="h-full rounded-full bg-cyan-400" style={{ width: `${hexWeaponReadinessRatio(selectedShipWeapon) * 100}%` }} /></div>
-                      <div className="mt-2 text-xs text-slate-300">{EQUIPMENT_CATALOG[selectedShipWeapon.id]?.description || 'Ship-mounted weapon system.'}</div>
-                      {selectedWeaponSide === 'player' && !run.combat.outcome ? (
-                        <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                          <ActionButton tone="amber" onClick={() => setRun((prev) => selectHexCombatWeapon(prev, 'player', selectedWeaponIndex))}>Keep tactical click on this weapon</ActionButton>
-                          <ActionButton tone="cyan" disabled={!weaponCanFireInHexCombat(run, selectedShipWeapon, true) || !selectedTarget} onClick={() => setRun((prev) => fireHexCombatShipWeapon(prev, selectedWeaponIndex))}>Fire at {selectedTarget?.name || 'target'}</ActionButton>
-                        </div>
-                      ) : null}
-                    </div>
-                  ) : (
-                    <div className="rounded-2xl border border-dashed border-slate-700/80 px-4 py-4 text-sm text-slate-400">Select a ship weapon from the side panel to inspect it here.</div>
-                  )
-                ) : (
-                  <>
-                    <div className="rounded-2xl border border-slate-800 bg-slate-950/45 p-2.5">
-                      <div className="flex flex-col gap-4 lg:flex-row">
-                        <div className="rounded-2xl border border-slate-700 bg-slate-950 p-2">
-                          <svg viewBox="0 0 72 72" className="h-20 w-20">
-                            <circle cx="36" cy="36" r="22" fill="#0f172a" stroke="#22c55e" strokeWidth="3" />
-                            {Array.from({ length: Math.max(1, squadronAliveCount(selectedUnit.unit)) }, (_, index) => {
-                              const angle = (Math.PI * 2 * index) / Math.max(1, squadronAliveCount(selectedUnit.unit))
-                              return <circle key={`detail_drone_${index}`} cx={36 + Math.cos(angle) * 16} cy={36 + Math.sin(angle) * 16} r="4" fill="#bbf7d0" stroke="#14532d" strokeWidth="1" />
-                            })}
-                            <circle cx="36" cy="36" r="7" fill="#16a34a" />
-                          </svg>
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-start justify-between gap-3">
-                            <div>
-                              <div className="text-sm font-semibold">{selectedUnit.name}</div>
-                              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{selectedUnit.subtitle}</div>
-                            </div>
-                            <div className="text-xs text-slate-400">{selectedUnit.side === 'player' ? 'Player unit' : 'Enemy unit'}</div>
-                          </div>
-                          <div className="mt-3 grid gap-2 sm:grid-cols-3 xl:grid-cols-6">
-                            <MiniStat label="Count" value={selectedUnit.countLabel} tone="amber" />
-                            <MiniStat label="Status" value={selectedUnit.statusLabel || (selectedUnit.canAct ? 'Ready' : 'Spent')} tone={selectedUnit.canAct ? 'green' : 'slate'} />
-                            <MiniStat label="Speed" value={selectedUnit.speed} tone="green" />
-                            <MiniStat label="Dodge" value="Close range" tone="cyan" />
-                            <MiniStat label="Target" value={selectedTarget?.name || 'None'} tone="amber" />
-                            <MiniStat label="Move hexes" value={selectedMoveHexes.length} tone="green" />
-                          </div>
-                          <div className="mt-3 h-2 overflow-hidden rounded-full border border-slate-700 bg-slate-950">
-                            <div className="h-full rounded-full bg-emerald-400" style={{ width: `${((selectedUnit.hull || 0) / Math.max(1, selectedUnit.hullMax || 1)) * 100}%` }} />
-                          </div>
-                          <div className="mt-3 grid gap-3 md:grid-cols-2">
-                            <LayerPips label="Shields" total={selectedShieldTotal} filled={selectedShieldFilled} activeColour="#3b82f6" />
-                            <LayerPips label="Armour" total={Math.max(0, selectedUnit.armourMax || 0)} filled={Math.max(0, selectedUnit.armour || 0)} activeColour="#f8fafc" />
-                          </div>
-                          {selectedUnit.side === 'player' ? (
-                            <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                              <MiniStat label="Action preview" value={selectedAttackPreview.canAttack ? 'Attack ready' : selectedAttackPreview.reason} tone={selectedAttackPreview.canAttack ? 'rose' : 'slate'} />
-                              <MiniStat label="Grid action" value="Move and strike" tone="amber" />
-                            </div>
-                          ) : null}
-                        </div>
-                      </div>
-                    </div>
-
-                    {selectedUnit.side === 'player' && !run.combat.outcome ? (
-                      <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_300px]">
-                        <div className="rounded-2xl border border-emerald-800 bg-emerald-950/10 p-2.5">
-                          <div className="text-xs uppercase tracking-[0.18em] text-emerald-300">Drone action</div>
-                          <div className="mt-2 text-xs text-slate-300">Move on the grid, then strike in the same turn. Hover a hostile for a red or grey bulls-eye, then click to attack.</div>
-                          <div className="mt-3">
-                            <ActionButton tone="green" disabled={!selectedSquadronCanAttack} onClick={() => setRun((prev) => fireHexCombatSquadron(prev, selectedUnit.id))}>Attack {selectedTarget?.name || 'target'}</ActionButton>
-                          </div>
-                        </div>
-
-                        <div className="grid gap-3">
-                          <div className="rounded-2xl border border-slate-800 bg-slate-950/45 p-2.5">
-                            <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Unit actions</div>
-                            <div className="mt-2 text-xs text-slate-300">Attack drones have {selectedUnit.unit.actionsRemaining || 0} movement point(s) left this turn and can still strike adjacent hostile units, including the enemy ship.</div>
-                            <div className="mt-3 grid gap-2">
-                              <ActionButton tone={selectedSquadronCanAttack ? 'green' : 'slate'} disabled={!selectedSquadronCanAttack} onClick={() => setRun((prev) => fireHexCombatSquadron(prev, selectedUnit.id))}>Confirm attack on {selectedTarget?.name || 'target'}</ActionButton>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ) : null}
-                  </>
-                )}
-              </div>
-            ) : (
-              <div className="mt-3 text-sm text-slate-400">No tactical unit is selected. Click a ship, squadron, or ship weapon in the tactical view.</div>
-            )}
-          </div>
-
-          <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
-            <div className="grid grid-cols-1 content-start gap-3">
-              {negotiation ? (
-                <div className="rounded-3xl border border-amber-800 bg-amber-950/20 p-3">
-                  <div className="text-xs uppercase tracking-[0.2em] text-amber-300">Combat negotiation</div>
-                  <div className="mt-2 text-sm text-slate-200">{negotiation.text}</div>
-                  <div className="mt-3 grid gap-2">
-                    <ActionButton tone="green" onClick={() => setRun((prev) => resolveHexCombatNegotiation(prev, 'accept'))}>{negotiation.side === 'enemy' ? 'Accept surrender' : 'Pay counteroffer'}</ActionButton>
-                    <ActionButton tone="rose" onClick={() => setRun((prev) => resolveHexCombatNegotiation(prev, 'reject'))}>{negotiation.side === 'enemy' ? 'Reject and continue' : 'Reject counteroffer'}</ActionButton>
-                  </div>
-                </div>
-              ) : null}
-
-              <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
-                <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Combat feed</div>
-                <div className="mt-3 grid max-h-[260px] gap-2 overflow-auto pr-1 text-sm text-slate-300">
-                  {run.combat.feed.map((entry, index) => {
-                    const meta = classifyCombatFeedEntry(entry)
-                    return <div key={`${entry}_${index}`} className={`rounded-2xl border px-3 py-2 ${meta.tone}`}><div className="flex items-start justify-between gap-3"><div className="text-sm">{entry}</div><div className="text-[10px] uppercase tracking-[0.18em] opacity-70">{meta.badge}</div></div></div>
-                  })}
-                </div>
-              </div>
-            </div>
-
-            <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-3">
-              <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Crew stations</div>
-              <div className="mt-3"><CombatCrewStrip crew={run.crew} selectedCrewId={run.ui.selectedCrewId} onSelect={(crewId) => setRun((prev) => selectCrewMember(prev, crewId))} /></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
+    return <FleetCombatScreen run={run} setRun={setRun} now={now} />
   }
 
   if (run.screen === 'combat' && run.combat) {
@@ -7037,48 +8217,31 @@ export default function STLSynthesisedGame() {
 
   const current = findNode(run.system, run.currentNodeId)
   const systemViewBox = getMapViewBox(run.ui)
-  const infoNode = run.ui.mainTerminal === 'system' ? selectedNode : current
-  const selectedTravelTarget = selectedNode
-  const selectedReachable = selectedTravelTarget ? reachableIds.has(selectedTravelTarget.id) : false
-  const selectedOrbitInfo = infoNode ? orbitForecast(run.system, infoNode) : null
-  const meteorPath = run.system.meteorPath
-  const meteorCurrentEligible = meteorPath ? nodeOnMeteorPath(run.system, current, meteorPath) : false
-  const meteorSelectedEligible = meteorPath && selectedTravelTarget ? nodeOnMeteorPath(run.system, selectedTravelTarget, meteorPath) : false
-  const meteorRideAvailable = Boolean(meteorPath && meteorCurrentEligible && meteorSelectedEligible && selectedTravelTarget && selectedTravelTarget.id !== current.id)
-  const currentDepartureIndex = current.kind === 'base_departure' ? current.departureIndex : null
-  const currentIsArrivalStation = current.kind === 'base_arrival'
-  const dockedAtCardinalBase = isDockedAtCardinalBase(current)
-  const selectedCargoDefinition = selectedCargoEntry?.kind === 'equipment' ? EQUIPMENT_CATALOG[selectedCargoEntry.itemId] : null
-  const selectedWeaponDefinition = selectedWeaponSlot ? EQUIPMENT_CATALOG[selectedWeaponSlot.id] : null
-  const selectedCrew = run.crew.find((member) => member.id === run.ui.selectedCrewId) || null
+  const view = run.ui.view === 'map' ? 'map' : 'ship'
+  const sheet = run.ui.sheet || null
   const selectedNpc = findNpcShip(run.system, run.ui.selectedNpcId) || null
-  const selectedNpcNode = selectedNpc ? findNode(run.system, selectedNpc.currentNodeId) : null
   const selectedNpcHere = selectedNpc ? selectedNpc.currentNodeId === current.id : false
-  const merchantSource = run.ui.merchantContext
-    ? merchantSourceById(run.system, run.ui.merchantContext.id)
-    : (run.ui.merchantOpen && current.kind === 'merchant' && infoNode?.id === current.id ? { type: 'node', entity: current } : null)
-  const merchantTradeVisible = run.ui.mainTerminal === 'system' && run.ui.merchantOpen && Boolean(merchantSource)
-  const merchantStock = merchantSource?.entity?.stock || []
+  const isHereSelected = !selectedNode || selectedNode.id === current.id
+  const selectedReachable = selectedNode ? reachableIds.has(selectedNode.id) : false
+  const meteorPath = run.system.meteorPath
+  const meteorRideAvailable = Boolean(meteorPath && selectedNode && !isHereSelected && nodeOnMeteorPath(run.system, current, meteorPath) && nodeOnMeteorPath(run.system, selectedNode, meteorPath))
+  const travelMode = meteorRideAvailable ? 'meteor' : isHereSelected ? 'wait' : 'travel'
+  const jumpFuel = isHereSelected ? 0 : fuelCostForDistance(run, nodeDistance(run.system, current, selectedNode), travelMode)
+  const routeRisk = securityRiskForRoute(run, selectedNode || current, travelMode)
+  const dockedAtCardinalBase = isDockedAtCardinalBase(current)
+  const merchantSource = run.ui.merchantContext ? merchantSourceById(run.system, run.ui.merchantContext.id) : null
+  const tradeOpen = Boolean(run.ui.merchantOpen && merchantSource)
   const advancementPrompt = run.screen === 'map' ? currentPendingAdvancement(run) : null
   const advancementCrew = advancementPrompt ? run.crew.find((member) => member.id === advancementPrompt.crewId) || null : null
   const pendingEvent = run.pendingEvent
   const eventOutcome = run.ui.eventOutcome
-  const blockingPrompt = Boolean(advancementPrompt || pendingEvent || eventOutcome)
-  const selectedTravelMode = meteorRideAvailable ? 'meteor' : selectedTravelTarget?.id === current.id ? 'wait' : 'travel'
-  const selectedRouteRisk = selectedTravelTarget ? securityRiskForRoute(run, selectedTravelTarget, selectedTravelMode) : null
-
-  const handleEquipmentDragStart = (event, payload) => {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('application/json', JSON.stringify(payload))
-  }
-
-  const readEquipmentDrop = (event) => {
-    try {
-      return JSON.parse(event.dataTransfer.getData('application/json'))
-    } catch {
-      return null
-    }
-  }
+  const travelling = Boolean(run.ui.travelAnimation)
+  const localLabel = localActionLabel(current)
+  const ghostPos = (() => {
+    if (!selectedNode || isHereSelected || travelling) return null
+    const ghostSystem = { ...run.system, orbitOffsets: nextOrbitOffsets(run.system, false) }
+    return nodePosition(ghostSystem, selectedNode)
+  })()
 
   const shipAnimationPos = (() => {
     if (!run.ui.travelAnimation) return nodePosition(animatedSystem || run.system, current)
@@ -7090,307 +8253,146 @@ export default function STLSynthesisedGame() {
     return { x: fromPos.x + (toPos.x - fromPos.x) * progress, y: fromPos.y + (toPos.y - fromPos.y) * progress }
   })()
 
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 p-3">
-      <RunMenu run={run} setRun={setRun} />
-      <div className="mx-auto w-full max-w-7xl">
-        <div className="rounded-3xl border border-slate-800 bg-slate-900 shadow-2xl overflow-hidden">
-          <div className="grid grid-cols-1 gap-3 p-3 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-            <div className="rounded-3xl border-2 border-cyan-700 bg-slate-950/70 overflow-hidden shadow-lg">
-              <div className="border-b border-cyan-800/70 px-4 py-3"><div className="flex items-center justify-between gap-3"><div className="text-xs uppercase tracking-[0.24em] text-cyan-300">primary terminal</div><div className="text-[10px] uppercase tracking-[0.2em] text-slate-500">turn {run.turn} · system {run.systemIndex}</div></div></div>
-              <ShipStatusStrip player={run.player} fuel={run.resources.fuel} fuelCapacity={run.player.fuelCapacity} shipName={run.shipName} playerName={run.playerName} resources={run.resources} />
-              <div className="grid grid-cols-5 gap-2 p-3 border-b border-slate-800"><TerminalTab active={run.ui.mainTerminal === 'system'} onClick={() => setRun((prev) => setMainTerminal(prev, 'system'))}>system</TerminalTab><TerminalTab active={run.ui.mainTerminal === 'local'} onClick={() => setRun((prev) => setMainTerminal(prev, 'local'))}>local</TerminalTab><TerminalTab active={run.ui.mainTerminal === 'ship'} onClick={() => setRun((prev) => setMainTerminal(prev, 'ship'))}>ship</TerminalTab><TerminalTab active={run.ui.mainTerminal === 'crew'} onClick={() => setRun((prev) => setMainTerminal(prev, 'crew'))}>crew</TerminalTab><TerminalTab active={run.ui.mainTerminal === 'log'} onClick={() => setRun((prev) => setMainTerminal(prev, 'log'))}>log</TerminalTab></div>
-              <div className={run.ui.mainTerminal === 'ship' || run.ui.mainTerminal === 'crew' || run.ui.mainTerminal === 'log' ? 'h-[560px] overflow-auto p-3' : 'p-3'}>
-                {run.ui.mainTerminal === 'system' ? (
-                  <div ref={mapFrameRef} className="rounded-3xl border border-slate-800 bg-slate-950/80 p-2" style={{ touchAction: 'none' }} onTouchStart={handleMapTouchStart} onTouchMove={handleMapTouchMove} onTouchEnd={handleMapTouchEnd} onTouchCancel={handleMapTouchEnd} onMouseDown={handleMapMouseDown} onMouseMove={handleMapMouseMove} onMouseUp={handleMapMouseUp} onMouseLeave={handleMapMouseUp}>
-                    <div className="mb-2 flex justify-end gap-2">
-                      <button className="h-9 w-9 rounded-xl border border-slate-700 bg-slate-900 text-lg font-bold text-slate-100" onClick={() => setRun((prev) => zoomMap(prev, -0.35))}>-</button>
-                      <button className="h-9 w-9 rounded-xl border border-slate-700 bg-slate-900 text-lg font-bold text-slate-100" onClick={() => setRun((prev) => zoomMap(prev, 0.35))}>+</button>
-                    </div>
-                    <svg viewBox={systemViewBox} className="w-full aspect-square rounded-2xl bg-slate-950" onClick={handleMapClick}>
-                      <defs><radialGradient id="starGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stopColor="#fde68a" stopOpacity="1" /><stop offset="100%" stopColor="#f59e0b" stopOpacity="0.15" /></radialGradient></defs>
-                      <rect x="0" y="0" width="360" height="360" fill="#020617" />
-                      <circle cx="180" cy="180" r="18" fill="url(#starGlow)" />
-                      {meteorPath ? (() => { const { p1, p2 } = meteorLineEndpoints(meteorPath); return <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke="#fbbf24" strokeWidth="3" strokeDasharray="9 7" opacity="0.85" /> })() : null}
-                      {Array.from({ length: MASTER.orbitCount }, (_, orbit) => {
-                        const band = ringBand(orbit)
-                        const slotCount = MASTER.slotCounts[orbit]
-                        const rotationDeg = orbitRotationDeg(animatedSystem || run.system, orbit)
-                        return <g key={`orbit_${orbit}`}><g transform={`rotate(${rotationDeg} 180 180)`}>{Array.from({ length: slotCount }, (_, slot) => {
-                          const segmentNode = findNodeByOrbitSlot(run.system, orbit, slot)
-                          const startDeg = boundaryAngleOfSlot(slot, slotCount)
-                          const endDeg = boundaryAngleOfSlot(slot + 1, slotCount)
-                          const isSelectedSegment = selectedNode && selectedNode.orbit === orbit && selectedNode.slot === slot
-                          const isCurrentSegment = current && current.orbit === orbit && current.slot === slot
-                          const hasReachableNode = reachableIds.has(segmentNode.id) && segmentNode.id !== current.id
-                          const fill = hasReachableNode ? 'rgba(134, 239, 172, 0.7)' : isSelectedSegment ? 'rgba(34,211,238,0.22)' : segmentBaseFill(orbit, slot)
-                          const stroke = isCurrentSegment ? '#ef4444' : '#e2e8f0'
-                          const strokeOpacity = isCurrentSegment ? 1 : 0.55
-                          const strokeWidth = isCurrentSegment ? 3.8 : 1.1
-                          return <path key={`orbit_${orbit}_slot_${slot}`} d={describeRingSegment(180, 180, band.inner, band.outer, startDeg, endDeg)} fill={fill} stroke={stroke} strokeOpacity={strokeOpacity} strokeWidth={strokeWidth} onClick={(event) => { event.stopPropagation(); if (run.ui.travelAnimation) return; if (mapGestureRef.current.moved) { mapGestureRef.current.moved = false; return } setRun((prev) => ({ ...prev, selectedNodeId: segmentNode.id, ui: { ...prev.ui, selectedNpcId: null } })) }} style={{ cursor: run.ui.travelAnimation ? 'default' : 'pointer' }} />
-                        })}</g></g>
-                      })}
-                      {run.system.nodes.map((node) => {
-                        const pos = nodePosition(animatedSystem || run.system, node)
-                        const selected = node.id === run.selectedNodeId
-                        const currentHere = node.id === run.currentNodeId && !run.ui.travelAnimation
-                        const reachable = reachableIds.has(node.id) && node.id !== current.id
-                        const onMeteor = meteorPath ? nodeOnMeteorPath(run.system, node, meteorPath) : false
-                        const meta = KIND_META[isNodeDepleted(node) && !node.kind.startsWith('base') ? 'spent' : node.kind]
-                        const selectionRadius = currentHere ? 11 : selected ? 10 : node.kind === 'empty' ? (reachable ? 4 : 2.8) : 8
-                        const visibleFill = node.kind === 'empty' ? (reachable ? '#86efac' : '#1e293b') : (onMeteor ? '#1e1b4b' : '#0f172a')
-                        const visibleStroke = currentHere ? '#ef4444' : selected ? '#22d3ee' : reachable ? '#86efac' : '#334155'
-                        return <g key={node.id} onClick={(event) => { event.stopPropagation(); if (run.ui.travelAnimation) return; if (mapGestureRef.current.moved) { mapGestureRef.current.moved = false; return } setRun((prev) => ({ ...prev, selectedNodeId: node.id, ui: { ...prev.ui, selectedNpcId: null } })) }} style={{ cursor: run.ui.travelAnimation ? 'default' : 'pointer' }}><circle cx={pos.x} cy={pos.y} r={node.kind === 'empty' ? 11 : 16} fill="transparent" /><circle cx={pos.x} cy={pos.y} r={currentHere ? 11 : selected ? 10 : 8} fill={currentHere ? 'none' : 'transparent'} stroke={currentHere ? '#ef4444' : selected ? '#22d3ee' : 'transparent'} strokeWidth={currentHere ? 4 : 2.4} /><circle cx={pos.x} cy={pos.y} r={selectionRadius} fill={visibleFill} stroke={visibleStroke} strokeWidth={node.kind === 'empty' ? 1.1 : 1.5} /><text x={pos.x} y={pos.y + 2.1} textAnchor="middle" fontSize={node.kind.startsWith('base') ? '7.5' : node.kind === 'empty' ? '7' : '9.5'} fill={meta.colour} style={{ pointerEvents: 'none', userSelect: 'none' }}>{node.kind === 'empty' ? '' : node.kind.startsWith('base') ? (node.kind === 'base_arrival' ? 'A' : `D${node.departureIndex + 1}`) : meta.symbol}</text></g>
-                      })}
-                      {(run.system.npcs || []).map((npc) => {
-                        const node = findNode(run.system, npc.currentNodeId)
-                        const pos = nodePosition(animatedSystem || run.system, node)
-                        const meta = CONTACT_SHIP_META[npc.kind]
-                        const selected = npc.id === run.ui.selectedNpcId
-                        return <g key={npc.id} onClick={(event) => { event.stopPropagation(); if (run.ui.travelAnimation) return; if (mapGestureRef.current.moved) { mapGestureRef.current.moved = false; return } setRun((prev) => selectNpcShip(prev, npc.id)) }} style={{ cursor: run.ui.travelAnimation ? 'default' : 'pointer' }}><circle cx={pos.x} cy={pos.y} r="13" fill="#020617" stroke={selected ? '#f8fafc' : meta.colour} strokeWidth={selected ? 2.8 : 2} opacity="0.96" /><circle cx={pos.x} cy={pos.y} r="8.6" fill={meta.colour} opacity="0.22" /><text x={pos.x} y={pos.y + 2.2} textAnchor="middle" fontSize="10.5" fill={meta.colour} style={{ pointerEvents: 'none', userSelect: 'none' }}>{meta.symbol}</text><text x={pos.x + 15} y={pos.y - 12} fill={meta.colour} fontSize="7.5" fontWeight="700" style={{ pointerEvents: 'none', userSelect: 'none' }}>{npc.name.split(' ')[0]}</text></g>
-                      })}
-                      <g pointerEvents="none"><circle cx={shipAnimationPos.x} cy={shipAnimationPos.y} r="6.5" fill="#ffffff" stroke="#0f172a" strokeWidth="1.5" /><text x={shipAnimationPos.x} y={shipAnimationPos.y + 2} textAnchor="middle" fontSize="8" fill="#0f172a">▲</text></g>
-                    </svg>
-                  </div>
-                ) : null}
-                {run.ui.mainTerminal === 'local' ? <div className="flex flex-col items-center justify-start p-2"><div className="w-full rounded-3xl border border-slate-800 bg-slate-900/60 p-4"><div className="mt-3 flex items-center justify-center"><ShipGraphic /></div></div><div className="my-4 h-px w-24 bg-slate-700" /><div className="w-full"><LocalElementGraphic node={current} /></div></div> : null}
-                {run.ui.mainTerminal === 'ship' ? (
-                  <div className="h-full flex flex-col gap-4 p-2">
-                    <div className="rounded-3xl border border-slate-800 bg-slate-900/60 p-4"><div className="mt-3 flex items-center justify-center"><ShipGraphic /></div></div>
-                    <div className="grid grid-cols-2 gap-2">
-                      <MiniStat label="Ship" value={run.shipName} tone="cyan" />
-                      <MiniStat label="AI" value={run.playerName} tone="green" />
-                      <MiniStat label="Class" value={run.player.shipClass} />
-                      <MiniStat label="Value" value={`${run.player.value} credits`} tone="amber" />
-                      <MiniStat label="Armour" value={run.player.armour} />
-                      <MiniStat label="Hull" value={`${run.player.hull}/${run.player.hullMax}`} tone={run.player.hull <= 20 ? 'rose' : 'green'} />
-                      <MiniStat label="Shields" value={`${run.player.shields}/${run.player.shieldsMax}`} tone="cyan" />
-                      <MiniStat label="Speed" value={playerSpeedValue(run)} tone="green" />
-                      <MiniStat label="Stealth" value={playerStealthValue(run)} tone="green" />
-                      <MiniStat label="Maneuverability" value={`${Math.round(dodgeChance(run.player.maneuverability + pilotManeuverBonus(run)) * 100)}% dodge`} tone="cyan" />
-                      <MiniStat label="Crew" value={`${run.crew.length} / ${run.player.crewCapacity}`} tone="cyan" />
-                      <MiniStat label="Fuel tank" value={`${run.resources.fuel} / ${run.player.fuelCapacity}`} tone="amber" />
-                      <MiniStat label="Reserve fuel" value={`${reserveFuelAmount(run)} / ${reserveFuelCapacity(run)}`} tone="amber" />
-                      <MiniStat label="Total fuel" value={totalFuelAvailable(run)} tone="amber" />
-                      <MiniStat label="Power use" value={`${currentPowerUsage(run)} / ${run.player.maxPower}`} tone="amber" />
-                      <MiniStat label="Weapon slots" value={`${equippedWeapons(run.player).length} / ${run.player.weaponSlotsMax}`} tone="cyan" />
-                      <MiniStat label="Cargo used" value={`${cargoUsed(run)} / ${run.player.cargoCapacity}`} />
-                    </div>
-                    <div className="rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-semibold">Weapon mounts</div>
-                          <div className="text-xs text-slate-400">Drag equipped weapons into cargo to unequip them. Drag stored weapon crates onto a slot to install them.</div>
-                        </div>
-                        <div className="text-xs text-amber-200">{currentPowerUsage(run)} / {run.player.maxPower} power</div>
-                      </div>
-                      <div className="mt-4">
-                        <WeaponSlotGrid slots={run.player.weaponSlots} selectedSlotIndex={run.ui.selectedWeaponSlotIndex} now={now} onSelect={(slotIndex) => setRun((prev) => selectWeaponSlot(prev, slotIndex))} onDragStartSlot={(event, slotIndex) => handleEquipmentDragStart(event, { kind: 'weaponSlot', slotIndex })} onDropSlot={(event, slotIndex) => { const payload = readEquipmentDrop(event); if (!payload) return; setRun((prev) => { if (!prev) return prev; if (payload.kind === 'weaponSlot') return moveWeaponBetweenSlots(prev, payload.slotIndex, slotIndex); if (payload.kind === 'cargoWeapon') return moveCargoWeaponToSlot(prev, payload.cargoItemId, slotIndex); return prev }) }} />
-                      </div>
-                    </div>
-                    <div className="rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-semibold">Cargo hold</div>
-                          <div className="text-xs text-slate-400">Equipment, missile crates, and reserve fuel stacks each occupy cargo squares.</div>
-                        </div>
-                        <div className="text-xs text-slate-400">{cargoFree(run)} free</div>
-                      </div>
-                      <div className="mt-4">
-                        <CargoGrid cargoCapacity={run.player.cargoCapacity} entries={cargoEntries} selectedCargoItemId={run.ui.selectedCargoItemId} onSelect={(cargoItemId) => setRun((prev) => selectCargoItem(prev, cargoItemId))} onDragStartItem={(event, item) => handleEquipmentDragStart(event, { kind: 'cargoWeapon', cargoItemId: item.key })} onDropCell={(event) => { const payload = readEquipmentDrop(event); if (!payload) return; if (payload.kind !== 'weaponSlot') return; setRun((prev) => moveWeaponSlotToCargo(prev, payload.slotIndex)) }} />
-                      </div>
-                      <div className="mt-4 grid grid-cols-2 gap-2">
-                        <MiniStat label="Fuel" value={fuelStorageSummary(run)} tone="amber" />
-                        <MiniStat label="Credits" value={run.resources.credits} tone="amber" />
-                        <MiniStat label="Scrap" value={run.resources.scrap} tone="amber" />
-                        <MiniStat label="Parts" value={run.resources.parts} tone="cyan" />
-                        <MiniStat label="Cargo free" value={cargoFree(run)} tone="slate" />
-                        <MiniStat label="Police alert" value={run.system.securityAlert || 0} tone="rose" />
-                      </div>
-                    </div>
-                  </div>
-                ) : null}
-                {run.ui.mainTerminal === 'crew' ? <div className="grid gap-3 p-2"><div className="rounded-3xl border border-slate-800 bg-slate-900/60 p-4"><div className="flex items-center justify-between gap-3"><div><div className="text-sm font-semibold">Crew roster</div><div className="text-xs text-slate-400">Select a crew member to inspect them in the secondary terminal.</div></div><div className="text-xs text-cyan-200">{run.crew.length} / {run.player.crewCapacity} aboard</div></div><div className="mt-4 grid gap-2">{run.crew.length === 0 ? <div className="rounded-2xl border border-slate-800 bg-slate-950/45 p-3 text-sm text-slate-400">No crew remain on the ship.</div> : run.crew.map((member) => <button key={member.id} className={`rounded-2xl border px-4 py-3 text-left ${member.id === run.ui.selectedCrewId ? 'border-cyan-500 bg-cyan-950/20' : 'border-slate-800 bg-slate-950/45'}`} onClick={() => setRun((prev) => selectCrewMember(prev, member.id))}><div className="flex items-start justify-between gap-3"><div><div className="text-sm font-semibold">{member.name}</div><div className="mt-1 text-xs text-slate-400">{crewRoleLabel(member.role)} · Lv {crewLevel(member)} · {member.sex} · {member.isChild ? 'Dependent' : `${member.age} years`}</div>{crewHasWantedStatus(member) ? <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-rose-300">Wanted · {member.wantedReason}</div> : null}</div><div className="text-right"><div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">{member.trait}</div><div className="mt-1 text-[10px] text-cyan-200">{member.xp} xp</div></div></div><div className="mt-3 h-2 overflow-hidden rounded-full border border-rose-900/70 bg-slate-950"><div className="h-full rounded-full bg-rose-500" style={{ width: `${((member.health || 0) / Math.max(1, member.healthMax || 1)) * 100}%` }} /></div></button>)}</div></div></div> : null}
-                {run.ui.mainTerminal === 'log' ? <div className="grid gap-3 p-2"><div className="rounded-3xl border border-slate-800 bg-slate-900/60 p-4"><div className="flex items-center justify-between gap-3"><div><div className="text-sm font-semibold">Run log</div><div className="text-xs text-slate-400">Scrollable archive of travel, combat, trade, and system events, tagged by turn.</div></div><div className="text-xs text-slate-400">{run.log.length} entries · current turn {run.turn}</div></div><div className="mt-4 grid gap-2">{run.log.map((entry, index) => { const meta = classifyLogEntry(entry); const entryTurn = extractLogTurn(entry); return <div key={`${entry}_${index}`} className={`rounded-2xl border p-3 ${meta.tone}`}><div className="flex items-start gap-3"><div className="flex h-9 w-9 items-center justify-center rounded-2xl border border-slate-700 bg-slate-950/70 text-sm">{meta.icon}</div><div className="flex-1"><div className="flex items-center justify-between gap-3"><div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{meta.label}</div>{entryTurn !== null ? <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Turn {entryTurn}</div> : null}</div><div className="mt-1 text-sm text-slate-200">{rawLogText(entry)}</div></div></div></div> })}</div></div></div> : null}
-              </div>
-            </div>
+  const patchUi = (patch) => setRun((prev) => ({ ...prev, ui: { ...prev.ui, ...patch } }))
+  const openSheet = (name) => patchUi({ sheet: name })
+  const closeSheet = () => patchUi({ sheet: null })
+  const openCrew = (crewId) => setRun((prev) => ({ ...prev, ui: { ...prev.ui, sheet: 'crew', selectedCrewId: crewId || prev.ui.selectedCrewId } }))
+  const selectWaypoint = (nodeId) => setRun((prev) => ({ ...prev, selectedNodeId: nodeId, ui: { ...prev.ui, selectedNpcId: null } }))
+  const waitTurn = () => setRun((prev) => startTravelAnimation(prev, prev.currentNodeId, 'wait'))
+  const jump = () => setRun((prev) => startTravelAnimation(prev, selectedNode.id, meteorRideAvailable ? 'meteor' : 'normal'))
+  const mapHandlers = { touchStart: handleMapTouchStart, touchMove: handleMapTouchMove, touchEnd: handleMapTouchEnd, mouseDown: handleMapMouseDown, mouseMove: handleMapMouseMove, mouseUp: handleMapMouseUp, wheel: handleMapWheel }
 
-            <div className="grid grid-cols-1 content-start gap-3">
-              <div className="rounded-3xl border-2 border-emerald-700 bg-emerald-950/10 p-4 shadow-lg">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-emerald-800/50 pb-3">
-                <div className="text-xs uppercase tracking-[0.24em] text-emerald-300">secondary terminal</div>
-                <div className="flex flex-1 gap-2">
-                  <button className={`flex-1 rounded-xl px-3 py-2 text-sm font-semibold ${run.ui.legendOpen ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`} onClick={() => setRun((prev) => toggleLegend(prev))}>Legend</button>
-                  <button className="flex-1 rounded-xl bg-slate-800 px-3 py-2 text-sm font-semibold text-slate-100 disabled:text-slate-500" disabled={Boolean(run.ui.travelAnimation || blockingPrompt)} onClick={() => setRun((prev) => startTravelAnimation(prev, prev.currentNodeId, 'wait'))}>Wait</button>
-                  <button className={`flex-1 rounded-xl px-3 py-2 text-sm ${selectedTravelTarget && selectedTravelTarget.id !== current.id && selectedReachable && !run.ui.travelAnimation && !blockingPrompt ? 'bg-emerald-500 text-slate-950 font-bold' : 'bg-slate-900 text-slate-500 border border-slate-800'}`} disabled={!(selectedTravelTarget && selectedTravelTarget.id !== current.id && selectedReachable) || Boolean(run.ui.travelAnimation || blockingPrompt)} onClick={() => setRun((prev) => startTravelAnimation(prev, selectedTravelTarget.id, 'normal'))}>Travel</button>
-                </div>
-              </div>
+  const sheets = (
+    <>
+      <Sheet open={tradeOpen} title={merchantSource?.entity?.name || merchantSource?.entity?.label || 'Merchant'} subtitle={merchantSource?.type === 'npc' ? 'Shipboard exchange' : 'Merchant exchange'} onClose={() => setRun((prev) => setMerchantOpen(prev, false))}>
+        <TradeSheetContent run={run} setRun={setRun} merchantSource={merchantSource} />
+      </Sheet>
+      <Sheet open={!tradeOpen && sheet === 'here'} title={nodeTitle(current)} subtitle={KIND_META[current.kind]?.label} onClose={closeSheet}>
+        <HereSheetContent run={run} setRun={setRun} current={current} closeSheet={closeSheet} />
+      </Sheet>
+      <Sheet open={!tradeOpen && sheet === 'loadout'} title={run.shipName} subtitle={`${run.player.shipClass} · AI ${run.playerName}`} onClose={closeSheet}>
+        <LoadoutSheetContent run={run} setRun={setRun} cargoEntries={cargoEntries} />
+      </Sheet>
+      <Sheet open={!tradeOpen && sheet === 'crew'} title="Crew" subtitle={`${run.crew.length} of ${run.player.crewCapacity} berths`} onClose={closeSheet}>
+        <CrewSheetContent run={run} setRun={setRun} dockedAtCardinalBase={dockedAtCardinalBase} />
+      </Sheet>
+      <Sheet open={!tradeOpen && sheet === 'log'} title="Ship log" subtitle={`Turn ${run.turn}`} onClose={closeSheet}>
+        <LogSheetContent run={run} />
+      </Sheet>
+      <Sheet open={!tradeOpen && sheet === 'legend'} title="Map legend" onClose={closeSheet}>
+        <LegendSheetContent run={run} />
+      </Sheet>
+      <Sheet open={!tradeOpen && sheet === 'info'} title={nodeTitle(selectedNode || current)} subtitle={KIND_META[(selectedNode || current).kind]?.label} onClose={closeSheet}>
+        <InfoSheetContent run={run} node={selectedNode || current} current={current} risk={routeRisk} travelMode={travelMode} />
+      </Sheet>
+      <Sheet open={!tradeOpen && sheet === 'menu'} title="Menu" onClose={closeSheet}>
+        <MenuSheetContent run={run} setRun={setRun} onOpen={openSheet} />
+      </Sheet>
+    </>
+  )
 
-              {advancementPrompt && advancementCrew ? (
-                <div className="mt-3 rounded-2xl border border-cyan-800 bg-cyan-950/20 p-4">
-                  <div className="text-sm font-semibold text-cyan-100">{advancementCrew.name} reached level {advancementPrompt.level}</div>
-                  <div className="mt-2 text-sm text-slate-300">Choose one skill path and one perk to improve. New skills start at level 1.</div>
-                  <div className="mt-4 grid gap-3">
-                    {CREW_SKILL_IDS.map((skillId) => (
-                      <div key={skillId} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3">
-                        <div className="text-sm font-semibold">{skillLabel(skillId)} · current level {crewSkillLevel(advancementCrew, skillId)}</div>
-                        <div className="mt-3 grid gap-2">
-                          {CREW_SKILL_DEFS[skillId].perks.map((perk) => (
-                            <button key={perk.id} className="rounded-xl bg-cyan-500 px-3 py-2 text-left text-xs font-semibold text-slate-950" onClick={() => setRun((prev) => resolveCrewAdvancement(prev, skillId, perk.id))}>
-                              {perk.label} · {crewPerkLevel(advancementCrew, skillId, perk.id)} / 5
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
+  const overlays = advancementPrompt && advancementCrew
+    ? <AdvancementOverlay crewMember={advancementCrew} level={advancementPrompt.level} onChoose={(skillId, perkId) => setRun((prev) => resolveCrewAdvancement(prev, skillId, perkId))} />
+    : eventOutcome
+      ? <OutcomeOverlay outcome={eventOutcome} onClose={() => setRun((prev) => dismissEventOutcome(prev))} />
+      : pendingEvent
+        ? <EventOverlay event={pendingEvent} onChoose={(choiceId) => setRun((prev) => resolvePendingEvent(prev, choiceId))} />
+        : null
 
-              {!advancementPrompt && eventOutcome ? (
-                <div className={`mt-3 rounded-2xl border p-4 ${eventOutcome.tone === 'rose' ? 'border-rose-800 bg-rose-950/20' : eventOutcome.tone === 'amber' ? 'border-amber-800 bg-amber-950/20' : eventOutcome.tone === 'green' ? 'border-emerald-800 bg-emerald-950/20' : eventOutcome.tone === 'slate' ? 'border-slate-800 bg-slate-900/50' : 'border-cyan-800 bg-cyan-950/20'}`}>
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="text-sm font-semibold text-slate-100">{eventOutcome.title}</div>
-                      <div className="mt-2 text-sm text-slate-300">{eventOutcome.text}</div>
-                    </div>
-                    <button className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-slate-100" onClick={() => setRun((prev) => dismissEventOutcome(prev))}>Close</button>
-                  </div>
-                  {Array.isArray(eventOutcome.details) && eventOutcome.details.length > 0 ? <div className="mt-4 grid gap-2">{eventOutcome.details.map((detail, index) => <div key={`${detail}_${index}`} className="rounded-2xl border border-slate-800 bg-slate-950/45 px-3 py-2 text-sm text-slate-200">{detail}</div>)}</div> : null}
-                </div>
-              ) : null}
-
-              {!advancementPrompt && !eventOutcome && pendingEvent ? (
-                <div className="mt-3 rounded-2xl border border-cyan-800 bg-cyan-950/20 p-4">
-                  <div className="text-sm font-semibold text-cyan-100">{pendingEvent.title}</div>
-                  <div className="mt-2 text-sm text-slate-300">{pendingEvent.description}</div>
-                  <div className="mt-4 grid gap-2">
-                    {pendingEvent.choices.map((choice) => (
-                      <div key={choice.id} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3">
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <div className="text-sm font-semibold">{choice.label}</div>
-                            <div className="mt-1 text-xs text-slate-400">{choice.note}</div>
-                          </div>
-                          <button className="rounded-xl bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950" onClick={() => setRun((prev) => resolvePendingEvent(prev, choice.id))}>{choice.label}</button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-
-              {!advancementPrompt && !pendingEvent && !eventOutcome && run.ui.mainTerminal === 'system' && run.ui.legendOpen ? <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-3"><div className="flex flex-wrap items-center gap-x-4 gap-y-3 text-sm text-slate-200">{LEGEND_ITEMS.map((item) => <div key={item.kind} className="flex items-center gap-3"><div className="w-8 text-center text-2xl"><NodeGlyph kind={item.kind} size={22} /></div><div>{item.name}</div><div className="w-3" /><div className="text-slate-500">|</div></div>)}{meteorPath ? <div className="flex items-center gap-3"><div className="w-8 text-center text-base text-amber-300">╱</div><div>Meteor stream</div><div className="w-3" /><div className="text-slate-500">|</div></div> : null}</div></div> : null}
-
-              {!advancementPrompt && !pendingEvent && !eventOutcome && run.ui.mainTerminal === 'system' && !run.ui.legendOpen && !merchantTradeVisible ? (
-                selectedNpc ? (
-                  <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-4">
-                    <div className="flex items-start gap-4">
-                      <div className="flex h-20 w-20 items-center justify-center rounded-3xl border border-slate-800 bg-slate-950/70 text-4xl" style={{ color: CONTACT_SHIP_META[selectedNpc.kind].colour }}>{CONTACT_SHIP_META[selectedNpc.kind].symbol}</div>
-                      <div className="flex-1">
-                        <div className="text-xl font-bold">{selectedNpc.name}</div>
-                        <div className="text-sm text-slate-400">{CONTACT_SHIP_META[selectedNpc.kind].label} · {selectedNpc.shipClass}</div>
-                      </div>
-                    </div>
-                    <div className="mt-4 grid gap-2 text-sm text-slate-200">
-                      <div>Current waypoint: {selectedNpcNode?.label || 'Unknown'}</div>
-                      <div>Profile: speed {selectedNpc.speed} · stealth {selectedNpc.stealth} · maneuverability {selectedNpc.maneuverability} · value {selectedNpc.shipPrice} credits</div>
-                      <div>Detection posture: {selectedNpc.kind === 'pirate' ? 'Unstable and potentially hostile.' : selectedNpc.kind === 'patrol' ? 'Law-enforcement traffic.' : 'Open to contact when in comm range.'}</div>
-                      {selectedNpc.stock?.length ? <div>Trade availability: WHAT equipment · PRICE per unit in credits · STOCK per listing.</div> : null}
-                    </div>
-                    <div className="mt-4 grid gap-2">
-                      <ActionButton tone="cyan" disabled={!selectedNpcHere} onClick={() => setRun((prev) => hailNpcShip(prev, selectedNpc.id))}>{selectedNpcHere ? 'Hail ship' : 'Hail ship (same waypoint required)'}</ActionButton>
-                      <ActionButton tone="rose" disabled={!selectedNpcHere} onClick={() => setRun((prev) => attackNpcShip(prev, selectedNpc.id, `Attacked ${selectedNpc.name} from open space.`))}>{selectedNpcHere ? 'Attack ship' : 'Attack ship (same waypoint required)'}</ActionButton>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="mt-3 flex items-start gap-4"><div className="flex h-20 w-20 items-center justify-center rounded-3xl border border-slate-800 bg-slate-900/60 text-4xl">{infoNode ? <NodeGlyph kind={infoNode.kind} size={34} /> : null}</div><div className="flex-1"><div className="text-xl font-bold">{infoNode?.label}</div><div className="text-sm text-slate-400">{infoNode ? KIND_META[infoNode.kind].label : ''}</div></div></div>
-                    <div className="mt-4 grid gap-2 text-sm text-slate-200"><div>{infoNode?.description}</div>{infoNode?.opportunity ? <div><span className="text-slate-400">Opportunity:</span> {infoNode.opportunity}</div> : null}{infoNode?.danger ? <div><span className="text-slate-400">Danger:</span> {infoNode.danger}</div> : null}<div><span className="text-slate-400">Reachability:</span> {selectedTravelTarget && selectedTravelTarget.id !== current.id ? (selectedReachable ? `Reachable with ${fuelCostForDistance(run, nodeDistance(run.system, current, selectedTravelTarget), 'travel')} fuel.` : 'Not reachable with normal thrust from the current position.') : 'Current waypoint selected.'}</div><div><span className="text-slate-400">System pressure:</span> {run.system.type} · police {Math.round((run.system.policePressure || 0) * 100)}% · pirates {Math.round((run.system.piratePressure || 0) * 100)}% · alert {run.system.securityAlert || 0}</div>{selectedRouteRisk ? <div><span className="text-slate-400">Detection risk:</span> police {Math.round(selectedRouteRisk.policeChance * 100)}% · pirates {Math.round(selectedRouteRisk.pirateChance * 100)}% {meteorRideAvailable ? 'while riding the meteor stream' : selectedTravelTarget?.id === current.id ? 'while waiting in place' : 'on the selected route'}</div> : null}{selectedOrbitInfo ? <div><span className="text-slate-400">Orbit forecast:</span> orbit {infoNode.orbit + 1} · segment {selectedOrbitInfo.currentGlobalSlot + 1}/{selectedOrbitInfo.slotCount} now · next positions {selectedOrbitInfo.futureSlots.map((slot) => slot + 1).join(' → ')}</div> : null}</div>
-                    <div className="mt-4 grid gap-2">{meteorRideAvailable ? <ActionButton tone="cyan" onClick={() => setRun((prev) => startTravelAnimation(prev, selectedTravelTarget.id, 'meteor'))}>Hitch a ride on the meteor stream</ActionButton> : null}{current.kind === 'belt' && infoNode?.id === current.id ? <ActionButton tone="amber" disabled={!hasMiningLaser(run)} onClick={() => setRun((prev) => mineAsteroidBelt(prev))}>{hasMiningLaser(run) ? 'Mine asteroid belt' : 'Mining laser required'}</ActionButton> : null}{current.kind === 'depot' && infoNode?.id === current.id ? <ActionButton tone="amber" disabled={Boolean(current.salvaged)} onClick={() => setRun((prev) => salvageSupplyDepot(prev))}>{current.salvaged ? 'Depot already salvaged' : 'Salvage supply depot'}</ActionButton> : null}{current.kind === 'anomaly' && infoNode?.id === current.id ? <ActionButton tone="cyan" disabled={Boolean(current.spent)} onClick={() => setRun((prev) => probeAnomaly(prev))}>{current.spent ? 'Anomaly already probed' : 'Probe anomaly'}</ActionButton> : null}{current.kind === 'relay' && infoNode?.id === current.id ? <ActionButton tone="green" disabled={Boolean(current.spent)} onClick={() => setRun((prev) => queryNavigationRelay(prev))}>{current.spent ? 'Relay already queried' : 'Query navigation relay'}</ActionButton> : null}{current.kind === 'merchant' && infoNode?.id === current.id ? <ActionButton tone="amber" onClick={() => setRun((prev) => openMerchantExchange(prev, current.id, 'node'))}>Trade with merchant</ActionButton> : null}{(current.kind === 'station' || current.kind === 'base_arrival' || current.kind === 'base_departure') && infoNode?.id === current.id ? <div className="grid gap-2 md:grid-cols-2"><ActionButton onClick={() => setRun((prev) => repairHull(prev))}>Repair hull</ActionButton><ActionButton onClick={() => setRun((prev) => rechargeShields(prev))}>Recharge shields</ActionButton><ActionButton onClick={() => setRun((prev) => refuelShip(prev))}>Refuel ship</ActionButton><ActionButton disabled={crewAtCapacity(run)} onClick={() => setRun((prev) => recruitCrew(prev))}>{crewAtCapacity(run) ? 'Crew berths full' : 'Recruit crew'}</ActionButton></div> : null}{current.kind === 'shipyard' && infoNode?.id === current.id ? <div className="rounded-2xl border border-emerald-800 bg-emerald-950/10 p-3 text-sm text-slate-200"><div className="text-sm font-semibold text-emerald-200">Construction services</div><div className="mt-2 text-slate-300">Buy a new hull with trade-in value, or upgrade mounted weapons using credits and parts.</div></div> : null}{currentDepartureIndex !== null && infoNode?.id === current.id ? <ActionButton tone="green" onClick={() => setRun((prev) => travelToNextSystem(prev, currentDepartureIndex))}>{run.systemIndex === MASTER.maxSystems ? 'Complete run' : 'Travel to linked next system'}</ActionButton> : null}{currentIsArrivalStation && infoNode?.id === current.id ? <div className="rounded-2xl border border-amber-700 bg-amber-950/20 p-3 text-sm text-amber-100">This arrival station is locked for departure. Move to another Cardinal space station to leave the system.</div> : null}</div>
-                    {current.kind === 'shipyard' && infoNode?.id === current.id ? (
-                      <div className="mt-4 grid gap-3">
-                        <div className="rounded-2xl border border-emerald-800 bg-emerald-950/10 p-3">
-                          <div className="text-sm font-semibold text-emerald-200">Shipyard market</div>
-                          <div className="mt-2 grid grid-cols-[minmax(0,1fr)_110px_72px] gap-2 rounded-2xl border border-slate-800 bg-slate-950/45 px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-slate-500"><div>What</div><div>Price per unit</div><div>Stock</div></div>
-                          <div className="mt-2 grid gap-2">
-                            {Object.entries(SHIP_PRESETS).map(([shipClass, preset]) => {
-                              const netPrice = shipyardNetPrice(run, shipClass)
-                              const blocked = shipClass === run.player.shipClass || run.crew.length > preset.crewCapacity || cargoUsed(run) > preset.cargoCapacity || equippedWeapons(run.player).length > preset.weaponSlots || currentPowerUsage(run) > preset.maxPower || run.resources.credits < netPrice
-                              return <div key={shipClass} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3"><div className="grid grid-cols-[minmax(0,1fr)_110px_72px_auto] gap-3 items-start"><div><div className="text-sm font-semibold">{shipClass}</div><div className="text-xs text-slate-400">Value {preset.value} · trade-in {run.player.value} · weapon slots {preset.weaponSlots}</div><div className="mt-1 text-xs text-slate-400">Hull {preset.hullMax} · shields {preset.shieldsMax} · cargo {preset.cargoCapacity} · power {preset.maxPower}</div></div><div className="text-sm text-amber-200">{netPrice} credits</div><div className="text-sm text-slate-300">1</div><button className={`rounded-xl px-3 py-2 text-xs font-semibold ${blocked ? 'bg-slate-800 text-slate-500' : 'bg-emerald-500 text-slate-950'}`} disabled={blocked} onClick={() => setRun((prev) => buyShipAtShipyard(prev, shipClass))}>{shipClass === run.player.shipClass ? 'Current' : 'Buy'}</button></div></div>
-                            })}
-                          </div>
-                        </div>
-                        <div className="rounded-2xl border border-cyan-800 bg-cyan-950/10 p-3">
-                          <div className="text-sm font-semibold text-cyan-100">Mounted upgrades</div>
-                          <div className="mt-2 grid grid-cols-[minmax(0,1fr)_110px_72px] gap-2 rounded-2xl border border-slate-800 bg-slate-950/45 px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-slate-500"><div>What</div><div>Price per unit</div><div>Stock</div></div>
-                          <div className="mt-2 grid gap-2">
-                            {run.player.weaponSlots.filter(Boolean).length === 0 ? <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3 text-sm text-slate-400">No mounted weapons are installed.</div> : run.player.weaponSlots.map((weapon, index) => weapon ? (() => {
-                              const nextLevel = equipmentLevel((weapon.level || 1) + 1)
-                              const creditCost = 22 + nextLevel * 12
-                              const partsCost = 2 + nextLevel
-                              const maxed = equipmentLevel(weapon.level) >= 5
-                              return <div key={weapon.instanceId} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3"><div className="grid grid-cols-[minmax(0,1fr)_110px_72px_auto] gap-3 items-start"><div><div className="text-sm font-semibold">#{index + 1} {weapon.name}</div><div className="text-xs text-slate-400">Current level {equipmentLevel(weapon.level)} · next {maxed ? 'max' : equipmentLevelSuffix(nextLevel)}</div></div><div className="text-sm text-cyan-200">{maxed ? 'MAX' : `${creditCost} cr`}</div><div className="text-sm text-slate-300">{maxed ? '-' : `${partsCost} pt`}</div><button className={`rounded-xl px-3 py-2 text-xs font-semibold ${maxed || run.resources.credits < creditCost || run.resources.parts < partsCost ? 'bg-slate-800 text-slate-500' : 'bg-cyan-500 text-slate-950'}`} disabled={maxed || run.resources.credits < creditCost || run.resources.parts < partsCost} onClick={() => setRun((prev) => upgradeMountedWeaponAtShipyard(prev, index))}>{maxed ? 'Maxed' : 'Upgrade'}</button></div></div>
-                            })() : null)}
-                          </div>
-                        </div>
-                      </div>
-                    ) : null}
-                    {currentDepartureIndex !== null && infoNode?.id === current.id ? <div className="mt-4 grid gap-2">{run.system.candidatePreviews.map((preview, index) => <div key={preview.seed} className={`rounded-2xl border p-3 ${current.kind === 'base_departure' && current.departureIndex === index ? 'border-emerald-700 bg-emerald-950/20' : 'border-slate-800 bg-slate-900/50'}`}><div className="text-sm font-semibold">D{index + 1} → {preview.name}</div><div className="text-xs text-slate-400">{preview.type} · transit fuel {preview.transitFuel} · threat {preview.threat}</div><div className="mt-1 text-xs text-slate-300">{preview.note}</div></div>)}</div> : null}
-                  </>
-                )
-              ) : null}
-
-              {!advancementPrompt && !pendingEvent && !eventOutcome && merchantTradeVisible ? (
-                <div className="mt-3 rounded-2xl border border-amber-800 bg-amber-950/10 p-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="text-lg font-semibold">{merchantSource?.entity?.name || merchantSource?.entity?.label || 'Merchant exchange'}</div>
-                      <div className="text-sm text-slate-400">{merchantSource?.type === 'npc' ? 'Shipboard exchange' : 'Merchant exchange'}</div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-xs text-slate-400">{run.resources.credits} credits</div>
-                      <div className="text-xs text-slate-400">{cargoFree(run)} cargo free</div>
-                      <button className="mt-2 rounded-xl bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-100" onClick={() => setRun((prev) => setMerchantOpen(prev, false))}>Close</button>
-                    </div>
-                  </div>
-                  <div className="mt-4 flex gap-2">
-                    <button className={`flex-1 rounded-xl px-3 py-2 text-sm font-semibold ${run.ui.merchantTab === 'buy' ? 'bg-amber-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`} onClick={() => setRun((prev) => setMerchantTab(prev, 'buy'))}>Buy</button>
-                    <button className={`flex-1 rounded-xl px-3 py-2 text-sm font-semibold ${run.ui.merchantTab === 'sell' ? 'bg-amber-500 text-slate-950' : 'bg-slate-800 text-slate-100'}`} onClick={() => setRun((prev) => setMerchantTab(prev, 'sell'))}>Sell</button>
-                  </div>
-                  {run.ui.merchantTab === 'buy' ? (
-                    <div className="mt-4 grid gap-2">
-                      <div className="grid grid-cols-[minmax(0,1fr)_110px_72px] gap-2 rounded-2xl border border-slate-800 bg-slate-950/45 px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-slate-500"><div>What</div><div>Price per unit</div><div>Stock</div></div>
-                      {merchantStock.length === 0 ? <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3 text-sm text-slate-400">This merchant has nothing left worth buying.</div> : merchantStock.map((stockItem) => {
-                        const definition = EQUIPMENT_CATALOG[stockItem.itemId]
-                        const cannotAfford = run.resources.credits < stockItem.price
-                        const noSpace = cargoFree(run) < (definition?.size || 1)
-                        return <div key={stockItem.id} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3"><div className="grid grid-cols-[minmax(0,1fr)_110px_72px_auto] items-start gap-3"><div className="flex items-start gap-3"><div className="flex h-12 w-12 items-center justify-center rounded-2xl text-sm font-bold text-slate-950" style={{ backgroundColor: definition?.colour || '#94a3b8' }}>{stockItem.itemId === 'Missile_Ammo' ? `M${equipmentLevel(stockItem.missileLevel || stockItem.level)}` : definition?.icon}</div><div className="flex-1"><div className="text-sm font-semibold">{equipmentDisplayName(stockItem.itemId, stockItem.level || stockItem.missileLevel || 1, stockItem.itemId === 'Missile_Ammo' ? stockItem.amount : null)}</div><div className="text-xs text-slate-400">{stockItem.itemId === 'Missile_Ammo' ? `${stockItem.amount} level ${equipmentLevel(stockItem.missileLevel || stockItem.level)} missiles ready for launcher reloads.` : definition?.description}</div></div></div><div className="text-sm text-amber-200">{stockItem.price} credits</div><div className="text-sm text-slate-300">{stockItem.itemId === 'Missile_Ammo' ? stockItem.amount : 1}</div><button className={`rounded-xl px-3 py-2 text-xs font-semibold ${cannotAfford || noSpace ? 'bg-slate-800 text-slate-500' : 'bg-amber-500 text-slate-950'}`} disabled={cannotAfford || noSpace} onClick={() => setRun((prev) => buyMerchantItem(prev, merchantSource.entity.id, stockItem.id))}>Buy</button></div>{cannotAfford ? <div className="mt-2 text-xs text-rose-300">Not enough credits.</div> : null}{noSpace ? <div className="mt-2 text-xs text-rose-300">No free cargo space.</div> : null}</div>
-                      })}
-                    </div>
-                  ) : (
-                    <div className="mt-4 grid gap-2">
-                      <div className="grid grid-cols-[minmax(0,1fr)_110px_72px] gap-2 rounded-2xl border border-slate-800 bg-slate-950/45 px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-slate-500"><div>What</div><div>Price per unit</div><div>Stock</div></div>
-                      {run.cargo.length === 0 ? <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3 text-sm text-slate-400">No stored equipment is available to sell.</div> : run.cargo.map((cargoItem) => {
-                        const definition = EQUIPMENT_CATALOG[cargoItem.itemId]
-                        const salePrice = Math.max(3, Math.floor(equipmentPrice(definition, cargoItem.level || cargoItem.missileLevel || 1) * 0.65))
-                        return <div key={cargoItem.id} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3"><div className="grid grid-cols-[minmax(0,1fr)_110px_72px_auto] items-start gap-3"><div className="flex items-start gap-3"><div className="flex h-12 w-12 items-center justify-center rounded-2xl text-sm font-bold text-slate-950" style={{ backgroundColor: definition?.colour || '#94a3b8' }}>{cargoItem.itemId === 'Missile_Ammo' ? `M${equipmentLevel(cargoItem.missileLevel || cargoItem.level)}` : definition?.icon}</div><div className="flex-1"><div className="text-sm font-semibold">{equipmentDisplayName(cargoItem.itemId, cargoItem.level || cargoItem.missileLevel || 1, cargoItem.itemId === 'Missile_Ammo' ? cargoItem.amount : null)}</div><div className="text-xs text-slate-400">{cargoItem.itemId === 'Missile_Ammo' ? `${cargoItem.amount} missiles in this crate.` : definition?.description}</div></div></div><div className="text-sm text-emerald-200">{salePrice} credits</div><div className="text-sm text-slate-300">{cargoItem.itemId === 'Missile_Ammo' ? cargoItem.amount : 1}</div><button className="rounded-xl bg-amber-500 px-3 py-2 text-xs font-semibold text-slate-950" onClick={() => setRun((prev) => sellCargoItem(prev, merchantSource.entity.id, cargoItem.id))}>Sell</button></div></div>
-                      })}
-                    </div>
-                  )}
-                </div>
-              ) : null}
-
-              {!advancementPrompt && !pendingEvent && !eventOutcome && run.ui.mainTerminal === 'local' ? <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-3"><div className="text-sm font-semibold">Current local element</div><div className="mt-2 text-sm text-slate-300">{current.label} · {KIND_META[current.kind].label}</div><div className="mt-2 text-sm text-slate-300">{current.description}</div></div> : null}
-              {!blockingPrompt && run.ui.mainTerminal === 'ship' ? <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-3">{selectedWeaponSlot && selectedWeaponDefinition ? <div><div className="flex items-start gap-3"><div className="flex h-14 w-14 items-center justify-center rounded-2xl text-base font-bold text-slate-950" style={{ backgroundColor: selectedWeaponDefinition.colour }}>{selectedWeaponDefinition.icon}</div><div className="flex-1"><div className="text-sm font-semibold">{selectedWeaponSlot.name}</div><div className="text-xs text-slate-400">Weapon slot {Number(run.ui.selectedWeaponSlotIndex) + 1} · {equipmentPowerDraw(selectedWeaponSlot.id)} power · level {equipmentLevel(selectedWeaponSlot.level)}</div><div className="mt-2 text-sm text-slate-300">{selectedWeaponDefinition.description}</div><div className="mt-2 h-2 overflow-hidden rounded-full border border-emerald-900/70 bg-slate-950"><div className="h-full rounded-full bg-emerald-400" style={{ width: `${weaponHpRatio(selectedWeaponSlot) * 100}%` }} /></div></div></div><div className="mt-4 grid grid-cols-2 gap-2"><MiniStat label="Charge" value={`${Math.round(weaponChargeRatio(selectedWeaponSlot, now) * 100)}%`} tone="cyan" /><MiniStat label="Status" value={selectedWeaponSlot.broken ? 'Broken' : selectedWeaponSlot.enabled ? 'Powered' : 'Offline'} tone={selectedWeaponSlot.broken ? 'rose' : selectedWeaponSlot.enabled ? 'green' : 'amber'} /><MiniStat label="Health" value={`${Math.round(selectedWeaponSlot.hp || 0)} / ${selectedWeaponSlot.maxHp}`} tone="green" /><MiniStat label="Ammo" value={selectedWeaponSlot.ammoType ? `${weaponAmmoCount(run, selectedWeaponSlot, true)} ${ammoUnitsLabel(selectedWeaponSlot.ammoType)}` : 'None'} tone="slate" /></div>{selectedWeaponSlot.broken ? <div className="mt-4"><ActionButton tone="amber" onClick={() => setRun((prev) => repairBrokenWeapon(prev, Number(prev.ui.selectedWeaponSlotIndex)))}>Repair broken weapon</ActionButton></div> : null}</div> : selectedCargoEntry && (selectedCargoDefinition || selectedCargoEntry.kind === 'missile_ammo') ? <div><div className="flex items-start gap-3"><div className="flex h-14 w-14 items-center justify-center rounded-2xl text-base font-bold text-slate-950" style={{ backgroundColor: selectedCargoEntry.kind === 'missile_ammo' ? '#fb923c' : selectedCargoDefinition.colour }}>{selectedCargoEntry.kind === 'missile_ammo' ? `M${equipmentLevel(selectedCargoEntry.missileLevel)}` : selectedCargoDefinition.icon}</div><div className="flex-1"><div className="text-sm font-semibold">{selectedCargoEntry.kind === 'missile_ammo' ? equipmentDisplayName(selectedCargoEntry.itemId, selectedCargoEntry.missileLevel, selectedCargoEntry.amount) : equipmentDisplayName(selectedCargoEntry.itemId, selectedCargoEntry.level)}</div><div className="text-xs text-slate-400">{selectedCargoEntry.kind === 'missile_ammo' ? `${selectedCargoEntry.amount} missiles in cargo` : `${selectedCargoDefinition.kind} · ${selectedCargoDefinition.size} cargo space`}</div><div className="mt-2 text-sm text-slate-300">{selectedCargoEntry.kind === 'missile_ammo' ? selectedCargoEntry.description : selectedCargoDefinition.description}</div></div></div><div className="mt-4 grid grid-cols-2 gap-2"><MiniStat label="Value" value={`${selectedCargoEntry.price} credits`} tone="amber" /><MiniStat label="Type" value={selectedCargoEntry.kind === 'missile_ammo' ? 'ammo' : selectedCargoDefinition.kind} tone="cyan" />{selectedCargoEntry.kind === 'missile_ammo' ? <MiniStat label="Level" value={equipmentLevel(selectedCargoEntry.missileLevel)} tone="rose" /> : null}{selectedCargoEntry.weaponState ? <MiniStat label="Health" value={`${Math.round(selectedCargoEntry.weaponState.hp || 0)} / ${selectedCargoEntry.weaponState.maxHp}`} tone="green" /> : null}</div></div> : selectedCargoEntry?.kind === 'fuel' ? <div><div className="flex items-start gap-3"><div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500 text-base font-bold text-slate-950">{selectedCargoEntry.icon}</div><div className="flex-1"><div className="text-sm font-semibold">{selectedCargoEntry.title}</div><div className="text-xs text-slate-400">{selectedCargoEntry.subtitle}</div><div className="mt-2 text-sm text-slate-300">{selectedCargoEntry.description}</div></div></div><div className="mt-4 grid grid-cols-2 gap-2"><MiniStat label="Stored fuel" value={selectedCargoEntry.amount} tone="amber" /><MiniStat label="Stack size" value="5 per cargo" tone="amber" /></div></div> : <div><div className="text-sm font-semibold">Ship detail</div><div className="mt-2 text-sm text-slate-300">Select a weapon slot or a stored equipment square to inspect it here.</div><div className="mt-3 grid grid-cols-2 gap-2"><MiniStat label="Cargo used" value={`${cargoUsed(run)} / ${run.player.cargoCapacity}`} tone="amber" /><MiniStat label="Power use" value={`${currentPowerUsage(run)} / ${run.player.maxPower}`} tone="amber" /></div></div>}</div> : null}
-              {!blockingPrompt && run.ui.mainTerminal === 'crew' ? <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-3">{selectedCrew ? <div><div className="flex items-start gap-3"><div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-cyan-500/90 text-lg font-bold text-slate-950">{selectedCrew.name.slice(0, 2).toUpperCase()}</div><div className="flex-1"><div className="text-sm font-semibold">{selectedCrew.name}</div><div className="text-xs text-slate-400">{crewRoleLabel(selectedCrew.role)} · Lv {crewLevel(selectedCrew)} · {selectedCrew.sex} · {selectedCrew.isChild ? 'Dependent' : `${selectedCrew.age} years old`}</div><div className="mt-2 text-sm text-slate-300">{crewDescription(selectedCrew)}</div><div className="mt-2 h-2 overflow-hidden rounded-full border border-rose-900/70 bg-slate-950"><div className="h-full rounded-full bg-rose-500" style={{ width: `${((selectedCrew.health || 0) / Math.max(1, selectedCrew.healthMax || 1)) * 100}%` }} /></div></div></div><div className="mt-4 grid grid-cols-2 gap-2"><MiniStat label="Role" value={crewRoleLabel(selectedCrew.role)} tone="cyan" /><MiniStat label="Status" value={dockedAtCardinalBase ? 'Docked at Cardinal base' : 'In flight'} tone={dockedAtCardinalBase ? 'green' : 'amber'} /><MiniStat label="Trait" value={selectedCrew.trait} tone="slate" /><MiniStat label="Crew load" value={`${run.crew.length} / ${run.player.crewCapacity}`} tone="cyan" /><MiniStat label="Experience" value={`${selectedCrew.xp} xp`} tone="green" /><MiniStat label="Health" value={`${selectedCrew.health || 0} / ${selectedCrew.healthMax || 0}`} tone="rose" /><MiniStat label="Wanted" value={crewHasWantedStatus(selectedCrew) ? selectedCrew.wantedReason : 'No'} tone={crewHasWantedStatus(selectedCrew) ? 'rose' : 'green'} /><MiniStat label="Next level" value={xpToNextCrewLevel(selectedCrew) > 0 ? `${xpToNextCrewLevel(selectedCrew)} xp` : 'MAX'} tone="amber" /></div><div className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/45 p-3"><div className="text-xs uppercase tracking-[0.18em] text-slate-400">Skills</div><div className="mt-3 grid gap-2">{CREW_SKILL_IDS.filter((skillId) => crewSkillLevel(selectedCrew, skillId) > 0).length === 0 ? <div className="text-sm text-slate-400">No formal specializations yet.</div> : CREW_SKILL_IDS.filter((skillId) => crewSkillLevel(selectedCrew, skillId) > 0).map((skillId) => <div key={skillId} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3"><div className="text-sm font-semibold">{skillLabel(skillId)} · Lv {crewSkillLevel(selectedCrew, skillId)}</div><div className="mt-2 grid grid-cols-1 gap-1 text-xs text-slate-300">{CREW_SKILL_DEFS[skillId].perks.map((perk) => <div key={perk.id}>{perk.label}: {crewPerkLevel(selectedCrew, skillId, perk.id)} / 5</div>)}</div></div>)}</div></div><div className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/45 p-3 text-xs text-slate-400">{dockedAtCardinalBase ? 'Removing this crew member here will disembark them safely at the Cardinal space station.' : 'Removing this crew member away from a Cardinal space station is fatal.'}</div><div className="mt-4"><ActionButton tone={dockedAtCardinalBase ? 'amber' : 'rose'} onClick={() => setRun((prev) => removeCrewMember(prev, selectedCrew.id))}>{dockedAtCardinalBase ? 'Disembark crew member' : 'Eject crew member'}</ActionButton></div></div> : <div><div className="text-sm font-semibold">Crew detail</div><div className="mt-2 text-sm text-slate-300">No crew member is currently selected.</div></div>}</div> : null}
-            </div>
-
-              <div className="rounded-3xl border-2 border-violet-700 bg-violet-950/10 p-4 shadow-lg"><div className="text-xs uppercase tracking-[0.24em] text-violet-300 border-b border-violet-800/50 pb-3">tertiary terminal</div><div className="mt-3 grid gap-3"><div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3"><div className="text-xs uppercase tracking-[0.2em] text-slate-400">System telemetry</div><div className="mt-2 grid grid-cols-2 gap-2"><MiniStat label="Turn" value={run.turn} tone="green" /><MiniStat label="System" value={`${run.systemIndex} / ${MASTER.maxSystems}`} tone="cyan" /><MiniStat label="Current node" value={current.label} tone="slate" /><MiniStat label="Selected" value={selectedTravelTarget?.label || 'None'} tone="slate" /></div>{selectedTravelTarget ? <div className="mt-3 text-xs text-slate-300">Route cost {selectedTravelTarget.id === current.id ? 0 : fuelCostForDistance(run, nodeDistance(run.system, current, selectedTravelTarget), selectedTravelMode === 'travel' ? 'travel' : selectedTravelMode)} fuel · police {Math.round((selectedRouteRisk?.policeChance || 0) * 100)}% · pirates {Math.round((selectedRouteRisk?.pirateChance || 0) * 100)}%</div> : null}</div>{meteorPath ? <div className="rounded-2xl border border-amber-800 bg-amber-950/20 p-3"><div className="text-sm font-semibold text-amber-200">Interplanetary meteor stream</div><div className="mt-1 text-sm text-slate-300">{meteorPath.description}</div></div> : <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3 text-sm text-slate-300">No major system-wide events are currently active.</div>}<div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3"><div className="text-xs uppercase tracking-[0.2em] text-slate-400">Crew capability</div><div className="mt-3 grid gap-2">{run.crew.length === 0 ? <div className="text-sm text-slate-400">No crew remain aboard.</div> : run.crew.map((member) => <div key={member.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/45 px-3 py-2"><div><div className="text-sm font-semibold">{member.name}</div><div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{crewRoleLabel(member.role)}</div></div><div className="text-right"><div className="text-xs text-cyan-200">Lv {crewLevel(member)}</div><div className="text-[10px] text-slate-500">{member.xp} xp</div></div></div>)}</div></div></div></div>
-            </div>
+  if (view === 'ship') {
+    return (
+      <div className="mx-auto flex min-h-[100dvh] w-full max-w-[480px] flex-col px-4 pb-5 pt-4">
+        <div className="flex items-start gap-3">
+          <div className="grid flex-1 grid-cols-3 gap-4">
+            <Meter label="Hull" value={run.player.hull} max={run.player.hullMax} />
+            <Meter label="Shields" value={run.player.shields} max={run.player.shieldsMax} tone="accent" />
+            <Meter label="Fuel" value={run.resources.fuel} max={run.player.fuelCapacity} tone="fuel" />
           </div>
+          <IconButton icon="more" label="Menu" onClick={() => openSheet('menu')} />
+        </div>
+        <div className="mt-3 text-center text-[14px] text-mute">{run.resources.scrap} scrap · {run.resources.parts} parts · {run.resources.credits} credits · {run.resources.kinetic_ammo || 0} ammo</div>
+        <div className="mt-1 text-center text-[13px] text-mute">{run.system.name} · system {run.systemIndex} of {MASTER.maxSystems} · turn {run.turn}</div>
+        <div className="mt-4"><ShipTopDown run={run} onOpenLoadout={() => openSheet('loadout')} onOpenCrew={openCrew} /></div>
+        <div className="mt-3 text-center text-[15px] text-soft">{dockedAtCardinalBase ? 'Docked at' : 'At'} {nodeTitle(current)}</div>
+        <div className="mt-4 grid grid-cols-3 gap-2">
+          <SecondaryButton onClick={() => openCrew(run.crew[0]?.id)}><Icon name="crew" size={18} />Crew</SecondaryButton>
+          <SecondaryButton onClick={() => openSheet('loadout')}><Icon name="cargo" size={18} />Loadout</SecondaryButton>
+          <SecondaryButton onClick={() => openSheet('log')}><Icon name="log" size={18} />Log</SecondaryButton>
+        </div>
+        <div className="flex-1" />
+        <div className="mt-4 flex gap-2.5">
+          <SecondaryButton className="h-[60px] w-[132px] flex-none rounded-[18px]" tone={localLabel ? 'fuel' : 'plain'} onClick={() => openSheet('here')}>{localLabel || 'Here'}</SecondaryButton>
+          <PrimaryButton className="flex-1" onClick={() => patchUi({ view: 'map' })}>Jump</PrimaryButton>
+        </div>
+        {sheets}
+        {overlays}
+        <Toast message={toast} />
+      </div>
+    )
+  }
+
+  const targetNode = selectedNode && !isHereSelected ? selectedNode : null
+  const riskPercent = routeRisk ? Math.round(Math.max(routeRisk.policeChance, routeRisk.pirateChance) * 100) : 0
+  return (
+    <div className="mx-auto flex h-[100dvh] w-full max-w-[480px] flex-col overflow-hidden">
+      <div className="flex items-center gap-3 px-4 pt-3">
+        <IconButton icon="back" label="Back to ship" onClick={() => patchUi({ view: 'ship' })} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-display text-[18px] font-semibold">{run.system.name}</div>
+          <div className="text-[13px] text-mute">System {run.systemIndex} of {MASTER.maxSystems} · turn {run.turn}</div>
+        </div>
+        <div className="flex h-9 items-center rounded-[12px] bg-fuel/15 px-3 font-num text-[17px] font-bold text-fuel">{totalFuelAvailable(run)} fuel</div>
+        <IconButton icon="more" label="Menu" onClick={() => openSheet('menu')} />
+      </div>
+      <div className="relative mt-2">
+        <SystemMap run={run} animatedSystem={animatedSystem} reachableIds={reachableIds} selectedNode={selectedNode} current={current} shipAnimationPos={shipAnimationPos} ghostPos={ghostPos} viewBox={systemViewBox} mapFrameRef={mapFrameRef} gestureRef={mapGestureRef} handlers={mapHandlers} onSelectNode={selectWaypoint} onSelectNpc={(npcId) => setRun((prev) => selectNpcShip(prev, npcId))} />
+        <div className="absolute right-3 top-2 flex flex-col overflow-hidden rounded-[14px] bg-panel/90">
+          <button type="button" aria-label="Zoom in" onClick={() => setRun((prev) => zoomMap(prev, 0.35))} className="flex h-11 w-11 items-center justify-center"><Icon name="plus" size={20} /></button>
+          <button type="button" aria-label="Zoom out" onClick={() => setRun((prev) => zoomMap(prev, -0.35))} className="flex h-11 w-11 items-center justify-center"><Icon name="minus" size={20} /></button>
         </div>
       </div>
+      <div className="mt-1 px-4 text-center text-[14px] text-mute">{travelling ? 'Rings turning…' : 'The rings turn after every jump. Dashed circle: where your target will be.'}</div>
+      <div className="min-h-0 flex-1" />
+      <div className="mx-4 mb-4 flex flex-col gap-3.5 rounded-[22px] bg-panel p-4">
+        {selectedNpc ? (
+          <>
+            <div className="flex items-center gap-3.5">
+              <span className="flex h-12 w-12 flex-none items-center justify-center rounded-[14px] bg-raised" style={{ color: TONE_HEX[NPC_TONE[selectedNpc.kind] || 'neutral'] }}><Icon name={selectedNpc.kind === 'merchant' ? 'trade' : selectedNpc.kind === 'civilian' ? 'ship' : 'attack'} size={26} /></span>
+              <div className="min-w-0 flex-1"><div className="truncate font-display text-[18px] font-semibold">{selectedNpc.name}</div><div className="text-[14px] text-soft">{CONTACT_SHIP_META[selectedNpc.kind].label} · {selectedNpcHere ? 'here with you' : 'elsewhere in the system'}</div></div>
+              <IconButton icon="close" label="Deselect ship" className="bg-raised" onClick={() => setRun((prev) => selectNpcShip(prev, null))} />
+            </div>
+            <div className="flex gap-2.5">
+              <SecondaryButton className="h-[60px] flex-1 rounded-[18px]" disabled={!selectedNpcHere || travelling} onClick={() => setRun((prev) => hailNpcShip(prev, selectedNpc.id))}>Hail</SecondaryButton>
+              <PrimaryButton className="flex-1" tone="hostile" disabled={!selectedNpcHere || travelling} onClick={() => setRun((prev) => attackNpcShip(prev, selectedNpc.id, `Attacked ${selectedNpc.name} from open space.`))}>Attack</PrimaryButton>
+            </div>
+            {!selectedNpcHere ? <div className="-mt-1 text-center text-[13px] text-mute">Share its waypoint to hail or attack.</div> : null}
+          </>
+        ) : (
+          <>
+            <div className="flex items-center gap-3.5">
+              <span className="flex h-12 w-12 flex-none items-center justify-center rounded-[14px] bg-raised" style={{ color: TONE_HEX[nodeTone(nodeDisplayKind(targetNode || current))] === TONE_HEX.mute ? '#C9D3E0' : TONE_HEX[nodeTone(nodeDisplayKind(targetNode || current))] }}><Icon name={KIND_ICON[nodeDisplayKind(targetNode || current)] || 'info'} size={26} /></span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-display text-[18px] font-semibold">{nodeTitle(targetNode || current)}</div>
+                <div className="text-[14px] text-soft">{targetNode ? <>{KIND_META[targetNode.kind]?.label} · <span className="text-fuel">{jumpFuel} fuel</span>{riskPercent >= 10 ? ` · risk ${riskPercent}%` : ''}</> : 'You are here · waiting costs no fuel'}</div>
+              </div>
+              <IconButton icon="info" label="Details" className="bg-raised" onClick={() => openSheet('info')} />
+            </div>
+            <div className="flex gap-2.5">
+              <button type="button" aria-label="Wait one turn (no fuel)" title="Wait one turn" disabled={travelling} onClick={waitTurn} className="flex h-[60px] w-[60px] flex-none items-center justify-center rounded-[18px] bg-raised disabled:opacity-40"><Icon name="wait" size={24} /></button>
+              {targetNode ? (
+                <PrimaryButton className="flex-1" disabled={travelling || (!selectedReachable && !meteorRideAvailable) || totalFuelAvailable(run) < jumpFuel} onClick={jump}>
+                  {travelling ? 'Jumping…' : (!selectedReachable && !meteorRideAvailable) ? 'Out of range' : meteorRideAvailable ? `Ride stream · ${jumpFuel}` : 'Jump'}
+                </PrimaryButton>
+              ) : (
+                <PrimaryButton className="flex-1" tone={localLabel ? 'fuel' : 'accent'} disabled={travelling} onClick={() => (localLabel ? openSheet('here') : waitTurn())}>{travelling ? 'Waiting…' : localLabel || 'Wait'}</PrimaryButton>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+      {sheets}
+      {overlays}
+      <Toast message={toast} />
     </div>
   )
 }
